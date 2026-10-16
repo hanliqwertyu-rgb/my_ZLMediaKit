@@ -7,7 +7,7 @@
  * LICENSE file in the root of the source tree. All contributing project authors
  * may be found in the AUTHORS file in the root of the source tree.
  */
-
+#include "Extension/CloudUploader.h"   //新添加的代码，用于minio
 #include <signal.h>
 #include <iostream>
 #include "Util/File.h"
@@ -419,6 +419,7 @@ int start_main(int argc,char *argv[]) {
         InfoL << "已启动http api 接口";
         installWebHook();
         InfoL << "已启动http hook 接口";
+        installCloudUploader();  //新添加的代码，用于minio
 
         try {
             // rtsp服务器，端口默认554  [AUTO-TRANSLATED:07937d81]
@@ -520,6 +521,7 @@ int start_main(int argc,char *argv[]) {
     }
     unInstallWebApi();
     unInstallWebHook();
+    uninstallCloudUploader();   //新增加的代码，用于minio
     onProcessExited();
 
 #if defined(ENABLE_PYTHON)
