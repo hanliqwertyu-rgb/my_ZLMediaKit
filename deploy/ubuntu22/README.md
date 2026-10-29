@@ -14,6 +14,29 @@ SRT、RTP 代理已经编译但默认不监听；本镜像未启用 WebRTC、Pyt
 请将**当前包含全部修改和新增文件的工作区**同步到服务器，或保存到自己的版本库后拉取。
 直接克隆上游 ZLMediaKit 不包含这里新增的功能。无需携带 `build/`、`release/`、`out/`。
 
+从 GitHub 克隆或更新项目后，先在服务器的项目根目录拉取第三方子模块：
+
+```bash
+git submodule update --init --recursive
+git submodule status
+```
+
+项目将 `3rdpart/ZLToolKit`、`3rdpart/media-server`、`3rdpart/jsoncpp` 等作为 Git 子模块管理。
+只运行 `git clone`、`git pull` 或下载 GitHub 源码 ZIP，不保证这些目录包含实际源码。
+首次克隆可以使用 `git clone --recurse-submodules 你的仓库地址`。
+若通过压缩包或文件同步部署，必须包含已初始化的第三方源码，不能只复制空子模块目录。
+
+构建前确认以下文件存在：
+
+```bash
+ls 3rdpart/ZLToolKit/CMakeLists.txt \
+   3rdpart/jsoncpp/src/lib_json/json_reader.cpp \
+   3rdpart/media-server/libmov/source/mov-writer.c
+```
+
+若拉取子模块出现网络或认证错误，应先解决对应仓库的访问问题；本项目的子模块 URL
+可在 `.gitmodules` 中查看。不要通过关闭 MP4/HLS 或测试来绕过缺失依赖。
+
 在服务器的项目根目录检查：
 
 ```bash
@@ -74,6 +97,15 @@ sudo docker compose --env-file /opt/zlm/.env -f deploy/ubuntu22/compose.yaml con
 sudo docker compose --env-file /opt/zlm/.env -f deploy/ubuntu22/compose.yaml build
 sudo docker compose --env-file /opt/zlm/.env -f deploy/ubuntu22/compose.yaml up -d
 sudo docker compose --env-file /opt/zlm/.env -f deploy/ubuntu22/compose.yaml ps
+```
+
+若构建失败，保留完整日志；最后的 `failed to solve ... exit code: 1` 只是汇总，
+具体原因在它前面的 CMake、编译器或测试输出中：
+
+```bash
+set -o pipefail
+sudo docker compose --progress plain --env-file /opt/zlm/.env \
+  -f deploy/ubuntu22/compose.yaml build 2>&1 | tee zlm-build.log
 ```
 
 构建时安装 FFmpeg 开发库，检查 ENABLE_FFMPEG/MP4/HLS/OPENSSL 实际生效，

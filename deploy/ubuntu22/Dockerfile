@@ -18,6 +18,17 @@ WORKDIR /src
 COPY CMakeLists.txt ZLMVersion.h.ini default.pem DejaVuSans.ttf ./
 COPY cmake/ cmake/
 COPY 3rdpart/ 3rdpart/
+RUN set -eu; \
+    for source in \
+        3rdpart/ZLToolKit/CMakeLists.txt \
+        3rdpart/jsoncpp/src/lib_json/json_reader.cpp \
+        3rdpart/media-server/libmov/source/mov-writer.c; do \
+        if [ ! -f "$source" ]; then \
+            echo "Missing submodule source: $source" >&2; \
+            echo "Run git submodule update --init --recursive in the host repository before building." >&2; \
+            exit 1; \
+        fi; \
+    done
 COPY src/ src/
 COPY server/ server/
 COPY ext-codec/ ext-codec/
