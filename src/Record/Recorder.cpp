@@ -17,6 +17,8 @@
 #include "FMP4/FMP4MediaSourceMuxer.h"
 #include "TS/TSMediaSourceMuxer.h"
 
+#include "Extension/RecordGapFiller.h"
+
 using namespace std;
 using namespace toolkit;
 
@@ -77,7 +79,8 @@ std::shared_ptr<MediaSinkInterface> Recorder::createRecorder(type type, const Me
         case Recorder::type_mp4: {
 #if defined(ENABLE_MP4)
             auto path = Recorder::getRecordPath(type, tuple, option.mp4_save_path);
-            return std::make_shared<MP4Recorder>(tuple, path, option.mp4_max_second);
+            auto recorder = std::make_shared<MP4Recorder>(tuple, path, option.mp4_max_second);
+            return wrapRecordGapFiller(std::move(recorder), option.continue_push_ms, option.enable_audio);
 #else
             throw std::invalid_argument("mp4相关功能未打开，请开启ENABLE_MP4宏后编译再测试");
 #endif

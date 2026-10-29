@@ -1,0 +1,51 @@
+name: zlm
+
+services:
+  media:
+    image: ${ZLM_IMAGE:-my-zlm:2026-10-29}
+    platform: linux/amd64
+    build:
+      context: ../..
+      dockerfile: deploy/ubuntu22/Dockerfile
+      args:
+        BASE_IMAGE: ${ZLM_BASE_IMAGE:-ubuntu:22.04}
+        BUILD_JOBS: ${ZLM_BUILD_JOBS:-4}
+        SOURCE_REVISION: ${ZLM_SOURCE_REVISION:-workspace}
+    user: "${ZLM_UID:-10001}:${ZLM_GID:-10001}"
+    init: true
+    network_mode: host
+    restart: unless-stopped
+    stop_signal: SIGINT
+    stop_grace_period: 60s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - type: bind
+        source: ${ZLM_CONFIG_DIR:-./runtime/config}
+        target: /etc/zlm
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ZLM_DATA_DIR:-./runtime/data}
+        target: /var/lib/zlm
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ZLM_LOG_DIR:-./runtime/log}
+        target: /var/log/zlm
+        bind:
+          create_host_path: false
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"

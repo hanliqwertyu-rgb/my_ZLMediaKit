@@ -16,6 +16,8 @@
 #include "MPEG.h"
 #include "MP4Muxer.h"
 #include "Common/config.h"
+#include "Extension/RecordGapFiller.h"
+#include <stdexcept>
 
 namespace mediakit {
 
@@ -92,27 +94,95 @@ protected:
 };
 
 class HlsRecorder final : public HlsRecorderBase<MpegMuxer> {
+    using Base = HlsRecorderBase<MpegMuxer>;
+
 public:
     using Ptr = std::shared_ptr<HlsRecorder>;
+
     template <typename ...ARGS>
-    HlsRecorder(ARGS && ...args) : HlsRecorderBase<MpegMuxer>(false, std::forward<ARGS>(args)...) {}
+    HlsRecorder(ARGS && ...args)
+        : Base(false, std::forward<ARGS>(args)...) {
+        _gap_input = createTsGapInput(
+            _option.continue_push_ms, _option.enable_audio);
+        if (_gap_input && _option.hls_demand) {
+            throw std::invalid_argument(
+                "HLS gap fill requires hls_demand=0");
+        }
+    }
+
     ~HlsRecorder() override {
+        if (_gap_input) {
+            _gap_input->stop();
+            _gap_input.reset();
+        }
         try {
-            this->flush();
-        } catch (std::exception &ex) {
+            Base::flush();
+        } catch (const std::exception &ex) {
             WarnL << ex.what();
         }
     }
 
-private:
-    void onWrite(std::shared_ptr<toolkit::Buffer> buffer, uint64_t timestamp, bool key_pos) override {
-        if (!buffer) {
-            // reset tracks
-            _hls->inputData(nullptr, 0, timestamp, key_pos);
-        } else {
-            _hls->inputData(buffer->data(), buffer->size(), timestamp, key_pos);
+    void setListener(
+        const std::weak_ptr<MediaSourceEvent> &listener) {
+        Base::setListener(listener);
+        if (_gap_input) {
+            auto maker = _hls;
+            _gap_input->bindOutput(
+                maker->getMediaSource()->getOwnerPoller(),
+                [maker](toolkit::Buffer::Ptr buffer,
+                        uint64_t stamp, bool key) {
+                    maker->inputData(
+                        buffer ? buffer->data() : nullptr,
+                        buffer ? buffer->size() : 0,
+                        stamp, key);
+                });
         }
     }
+
+    bool addTrack(const Track::Ptr &track) override {
+        return _gap_input ? _gap_input->addTrack(track)
+                          : Base::addTrack(track);
+    }
+
+    void addTrackCompleted() override {
+        if (_gap_input) {
+            _gap_input->addTrackCompleted();
+        } else {
+            Base::addTrackCompleted();
+        }
+    }
+
+    bool inputFrame(const Frame::Ptr &frame) override {
+        return _gap_input ? _gap_input->inputFrame(frame)
+                          : Base::inputFrame(frame);
+    }
+
+    void resetTracks() override {
+        if (_gap_input) {
+            _gap_input->resetTracks();
+        } else {
+            Base::resetTracks();
+        }
+    }
+
+    void flush() override {
+        if (_gap_input) {
+            _gap_input->flush();
+        } else {
+            Base::flush();
+        }
+    }
+
+private:
+    void onWrite(toolkit::Buffer::Ptr buffer,
+                 uint64_t stamp, bool key) override {
+        _hls->inputData(
+            buffer ? buffer->data() : nullptr,
+            buffer ? buffer->size() : 0,
+            stamp, key);
+    }
+
+    TsGapInput::Ptr _gap_input;
 };
 
 /**

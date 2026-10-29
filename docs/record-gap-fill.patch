@@ -1,0 +1,2220 @@
+diff --git a/src/Record/HlsRecorder.h b/src/Record/HlsRecorder.h
+index df0317f2..c3e28920 100644
+--- a/src/Record/HlsRecorder.h
++++ b/src/Record/HlsRecorder.h
+@@ -16,6 +16,8 @@
+ #include "MPEG.h"
+ #include "MP4Muxer.h"
+ #include "Common/config.h"
++#include "Extension/RecordGapFiller.h"
++#include <stdexcept>
+ 
+ namespace mediakit {
+ 
+@@ -92,27 +94,95 @@ protected:
+ };
+ 
+ class HlsRecorder final : public HlsRecorderBase<MpegMuxer> {
++    using Base = HlsRecorderBase<MpegMuxer>;
++
+ public:
+     using Ptr = std::shared_ptr<HlsRecorder>;
++
+     template <typename ...ARGS>
+-    HlsRecorder(ARGS && ...args) : HlsRecorderBase<MpegMuxer>(false, std::forward<ARGS>(args)...) {}
++    HlsRecorder(ARGS && ...args)
++        : Base(false, std::forward<ARGS>(args)...) {
++        _gap_input = createTsGapInput(
++            _option.continue_push_ms, _option.enable_audio);
++        if (_gap_input && _option.hls_demand) {
++            throw std::invalid_argument(
++                "HLS gap fill requires hls_demand=0");
++        }
++    }
++
+     ~HlsRecorder() override {
++        if (_gap_input) {
++            _gap_input->stop();
++            _gap_input.reset();
++        }
+         try {
+-            this->flush();
+-        } catch (std::exception &ex) {
++            Base::flush();
++        } catch (const std::exception &ex) {
+             WarnL << ex.what();
+         }
+     }
+ 
+-private:
+-    void onWrite(std::shared_ptr<toolkit::Buffer> buffer, uint64_t timestamp, bool key_pos) override {
+-        if (!buffer) {
+-            // reset tracks
+-            _hls->inputData(nullptr, 0, timestamp, key_pos);
++    void setListener(
++        const std::weak_ptr<MediaSourceEvent> &listener) {
++        Base::setListener(listener);
++        if (_gap_input) {
++            auto maker = _hls;
++            _gap_input->bindOutput(
++                maker->getMediaSource()->getOwnerPoller(),
++                [maker](toolkit::Buffer::Ptr buffer,
++                        uint64_t stamp, bool key) {
++                    maker->inputData(
++                        buffer ? buffer->data() : nullptr,
++                        buffer ? buffer->size() : 0,
++                        stamp, key);
++                });
++        }
++    }
++
++    bool addTrack(const Track::Ptr &track) override {
++        return _gap_input ? _gap_input->addTrack(track)
++                          : Base::addTrack(track);
++    }
++
++    void addTrackCompleted() override {
++        if (_gap_input) {
++            _gap_input->addTrackCompleted();
++        } else {
++            Base::addTrackCompleted();
++        }
++    }
++
++    bool inputFrame(const Frame::Ptr &frame) override {
++        return _gap_input ? _gap_input->inputFrame(frame)
++                          : Base::inputFrame(frame);
++    }
++
++    void resetTracks() override {
++        if (_gap_input) {
++            _gap_input->resetTracks();
+         } else {
+-            _hls->inputData(buffer->data(), buffer->size(), timestamp, key_pos);
++            Base::resetTracks();
+         }
+     }
++
++    void flush() override {
++        if (_gap_input) {
++            _gap_input->flush();
++        } else {
++            Base::flush();
++        }
++    }
++
++private:
++    void onWrite(toolkit::Buffer::Ptr buffer,
++                 uint64_t stamp, bool key) override {
++        _hls->inputData(
++            buffer ? buffer->data() : nullptr,
++            buffer ? buffer->size() : 0,
++            stamp, key);
++    }
++
++    TsGapInput::Ptr _gap_input;
+ };
+ 
+ /**
+diff --git a/src/Record/Recorder.cpp b/src/Record/Recorder.cpp
+index 3247b448..feeffead 100644
+--- a/src/Record/Recorder.cpp
++++ b/src/Record/Recorder.cpp
+@@ -17,6 +17,8 @@
+ #include "FMP4/FMP4MediaSourceMuxer.h"
+ #include "TS/TSMediaSourceMuxer.h"
+ 
++#include "Extension/RecordGapFiller.h"
++
+ using namespace std;
+ using namespace toolkit;
+ 
+@@ -77,7 +79,8 @@ std::shared_ptr<MediaSinkInterface> Recorder::createRecorder(type type, const Me
+         case Recorder::type_mp4: {
+ #if defined(ENABLE_MP4)
+             auto path = Recorder::getRecordPath(type, tuple, option.mp4_save_path);
+-            return std::make_shared<MP4Recorder>(tuple, path, option.mp4_max_second);
++            auto recorder = std::make_shared<MP4Recorder>(tuple, path, option.mp4_max_second);
++            return wrapRecordGapFiller(std::move(recorder), option.continue_push_ms, option.enable_audio);
+ #else
+             throw std::invalid_argument("mp4相关功能未打开，请开启ENABLE_MP4宏后编译再测试");
+ #endif
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index dae613c1..c9346170 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -43,6 +43,7 @@ set(GATING_TESTS
+   test_av1_rtmp
+   test_amf
+   test_hls_cookie_data
++  test_record_gap_fill
+   test_sortor)
+ 
+ foreach(TEST_SRC ${TEST_SRC_LIST})
+diff --git a/src/Extension/RecordGapFiller.h b/src/Extension/RecordGapFiller.h
+new file mode 100644
+index 00000000..b7c2679e
+--- /dev/null
++++ b/src/Extension/RecordGapFiller.h
+@@ -0,0 +1,38 @@
++/* Copyright (c) ZLMediaKit contributors. SPDX-License-Identifier: MIT */
++#ifndef ZLMEDIAKIT_RECORD_GAP_FILLER_H
++#define ZLMEDIAKIT_RECORD_GAP_FILLER_H
++
++#include <functional>
++#include "Common/MediaSink.h"
++#include "Poller/EventPoller.h"
++
++namespace mediakit {
++
++// Wrap an encoded-frame sink. The disabled path returns the original sink.
++MediaSinkInterface::Ptr wrapRecordGapFiller(
++    MediaSinkInterface::Ptr recorder,
++    uint32_t retention_ms,
++    bool audio_enabled);
++
++class TsGapInput : public MediaSinkInterface {
++public:
++    using Ptr = std::shared_ptr<TsGapInput>;
++    using OnPacket = std::function<void(
++        toolkit::Buffer::Ptr, uint64_t, bool)>;
++
++    // Frontend operations run on the stream owner. Buffer startup frames until
++    // tracks and the output binding are ready. The first binding is retained.
++    virtual void bindOutput(
++        const toolkit::EventPoller::Ptr &owner,
++        OnPacket output) = 0;
++
++    // Join the encoding worker; already posted packet callbacks remain async.
++    virtual void stop() noexcept = 0;
++};
++
++TsGapInput::Ptr createTsGapInput(
++    uint32_t retention_ms,
++    bool audio_enabled);
++
++} // namespace mediakit
++#endif
+diff --git a/src/Extension/RecordGapFiller.cpp b/src/Extension/RecordGapFiller.cpp
+new file mode 100644
+index 00000000..328b09f9
+--- /dev/null
++++ b/src/Extension/RecordGapFiller.cpp
+@@ -0,0 +1,1128 @@
++/* Copyright (c) ZLMediaKit contributors. SPDX-License-Identifier: MIT */
++#include "RecordGapFiller.h"
++#include "Common/config.h"
++#include "Util/onceToken.h"
++#include "Util/util.h"
++#include "Record/MPEG.h"
++#include "ext-codec/AAC.h"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <condition_variable>
++#include <cstring>
++#include <deque>
++#include <limits>
++#include <mutex>
++#include <thread>
++#include <stdexcept>
++#include <vector>
++
++#if defined(__linux__) && !defined(ANDROID)
++#include <pthread.h>
++#include <sched.h>
++#endif
++
++#if defined(ENABLE_MP4) && defined(ENABLE_FFMPEG)
++#include "Extension/Factory.h"
++#include "ext-codec/H264.h"
++extern "C" {
++#include <libavcodec/avcodec.h>
++#include <libavutil/channel_layout.h>
++#include <libavutil/opt.h>
++#include <libswresample/swresample.h>
++#include <libswscale/swscale.h>
++}
++#endif
++
++using namespace toolkit;
++
++namespace mediakit {
++namespace {
++
++const char *kEnable = "record_gap_fill.enable";
++const char *kDetect = "record_gap_fill.detect_ms";
++const char *kMax = "record_gap_fill.max_ms";
++const char *kFps = "record_gap_fill.fps";
++const char *kBitrate = "record_gap_fill.bitrate";
++
++onceToken defaults([] {
++    auto &ini = mINI::Instance();
++    ini[kEnable] = false;
++    ini[kDetect] = 200;
++    ini[kMax] = 15000;
++    ini[kFps] = 25;
++    ini[kBitrate] = 2000000;
++});
++
++#if defined(ENABLE_MP4) && defined(ENABLE_FFMPEG)
++using Clock = std::chrono::steady_clock;
++using Time = Clock::time_point;
++constexpr size_t kLiveInputEvents = 256;
++constexpr size_t kStartupInputEvents = 2048;
++
++struct Options {
++    int buffer_ms;
++    int max_ms;
++    int fps;
++    int bitrate;
++    bool audio;
++};
++
++void check(int result, const char *operation) {
++    if (result < 0) {
++        char error[AV_ERROR_MAX_STRING_SIZE];
++        av_strerror(result, error, sizeof(error));
++        throw std::runtime_error(std::string("record_gap_fill: ") + operation + ": " + error);
++    }
++}
++
++struct ContextFree { void operator()(AVCodecContext *p) const { avcodec_free_context(&p); } };
++struct FrameFree { void operator()(AVFrame *p) const { av_frame_free(&p); } };
++struct PacketFree { void operator()(AVPacket *p) const { av_packet_free(&p); } };
++struct SwrFree { void operator()(SwrContext *p) const { swr_free(&p); } };
++struct SwsFree { void operator()(SwsContext *p) const { sws_freeContext(p); } };
++using Context = std::unique_ptr<AVCodecContext, ContextFree>;
++using Picture = std::shared_ptr<AVFrame>;
++using Packet = std::unique_ptr<AVPacket, PacketFree>;
++
++Picture picture() {
++    auto frame = Picture(av_frame_alloc(), FrameFree{});
++    if (!frame) { throw std::bad_alloc(); }
++    return frame;
++}
++
++Context context(const AVCodec *codec) {
++    if (!codec) { throw std::runtime_error("record_gap_fill: required codec unavailable"); }
++    Context result(avcodec_alloc_context3(codec));
++    if (!result) { throw std::bad_alloc(); }
++    return result;
++}
++
++AVCodecID inputCodec(CodecId codec) {
++    switch (codec) {
++        case CodecH264: return AV_CODEC_ID_H264;
++        case CodecH265: return AV_CODEC_ID_HEVC;
++        case CodecAAC: return AV_CODEC_ID_AAC;
++        case CodecG711A: return AV_CODEC_ID_PCM_ALAW;
++        case CodecG711U: return AV_CODEC_ID_PCM_MULAW;
++        default: throw std::invalid_argument("record_gap_fill: unsupported input codec");
++    }
++}
++
++double milliseconds(Time start, Time end) {
++    return std::chrono::duration<double, std::milli>(end - start).count();
++}
++
++struct Event {
++    enum Kind { TrackAdded, TracksComplete, FrameAdded, Reset, Flush } kind;
++    explicit Event(Kind value) : kind(value) {}
++    Track::Ptr track;
++    Frame::Ptr frame;
++    Time received = Clock::now();
++};
++
++struct TimedPicture {
++    double time_ms;
++    Picture frame;
++};
++
++struct AudioChunk {
++    int64_t start;
++    Picture frame;
++};
++
++// All FFmpeg and downstream operations run on this worker. The network thread
++// only clones metadata / retains cacheable frames and appends a bounded event.
++class RecordGapFiller final : public MediaSinkInterface {
++public:
++    RecordGapFiller(MediaSinkInterface::Ptr downstream, Options options)
++        : _downstream(std::move(downstream)), _options(options) {
++        _thread = std::thread([this] { run(); });
++    }
++
++    ~RecordGapFiller() override {
++        {
++            std::lock_guard<std::mutex> lock(_mutex);
++            _stop_time = Clock::now();
++            _stopping = true;
++        }
++        _condition.notify_one();
++        _thread.join();
++    }
++
++    bool addTrack(const Track::Ptr &track) override {
++        auto type = track->getTrackType();
++        if (type == TrackAudio && !_options.audio) { return true; }
++        if (type != TrackVideo && type != TrackAudio) { return false; }
++        if (!avcodec_find_decoder(inputCodec(track->getCodecId()))) {
++            throw std::invalid_argument("record_gap_fill: input decoder unavailable");
++        }
++        Event event{Event::TrackAdded};
++        event.track = track->clone();
++        return enqueue(std::move(event));
++    }
++
++    void addTrackCompleted() override { enqueue(Event{Event::TracksComplete}); }
++    void resetTracks() override { enqueue(Event{Event::Reset}); }
++    void flush() override { enqueue(Event{Event::Flush}); }
++
++    bool inputFrame(const Frame::Ptr &frame) override {
++        if (frame->getTrackType() == TrackAudio && !_options.audio) { return true; }
++        Event event{Event::FrameAdded};
++        event.frame = Frame::getCacheAbleFrame(frame);
++        return enqueue(std::move(event));
++    }
++
++private:
++    bool enqueue(Event event) {
++        std::lock_guard<std::mutex> lock(_mutex);
++        if (_failed || _stopping) { return false; }
++        if (event.kind == Event::Reset) { _startup_queue = true; }
++        size_t bytes = event.frame ? event.frame->size() : 0;
++        // A newly created recorder receives a cached GOP synchronously. Seven
++        // seconds of 25 fps video + 48 kHz AAC already exceeds 500 events, even
++        // with a healthy encoder. Allow this bounded startup burst, then return
++        // to the live limit once output has started and pending input is drained.
++        const size_t max_events = _startup_queue ? kStartupInputEvents : kLiveInputEvents;
++        if (_events.size() >= max_events || _queued_bytes + bytes > 32 * 1024 * 1024) {
++            _failed = true;
++            ErrorL << "record_gap_fill: input queue overflow; recording stopped, events=" << _events.size()
++                   << ", limit=" << max_events << ", queued_bytes=" << _queued_bytes
++                   << ", incoming_bytes=" << bytes << ", startup=" << _startup_queue;
++            _condition.notify_one();
++            return false;
++        }
++        _queued_bytes += bytes;
++        _events.emplace_back(std::move(event));
++        _condition.notify_one();
++        return true;
++    }
++
++    void run() noexcept {
++        try {
++            setThreadName("record gap fill");
++            // Linux threads inherit their creator's CPU mask and scheduling
++            // policy. Pollers are pinned and may use FIFO/99 when run as root;
++            // CPU-bound encoders must not share that core/real-time priority.
++            setThreadAffinity(-1);
++#if defined(__linux__) && !defined(ANDROID)
++            sched_param priority{};
++            int error = pthread_setschedparam(pthread_self(), SCHED_OTHER, &priority);
++            if (error) {
++                throw std::runtime_error(std::string("reset encoding thread scheduler: ") + std::strerror(error));
++            }
++#endif
++            while (true) {
++                std::deque<Event> batch;
++                bool stopping;
++                {
++                    std::unique_lock<std::mutex> lock(_mutex);
++                    _condition.wait_for(lock, std::chrono::milliseconds(10), [this] {
++                        return _stopping || _failed || !_events.empty();
++                    });
++                    if (_failed) { break; }
++                    // Consume a bounded batch before advancing the output clock.
++                    // In particular, video slices/config and audio often arrive
++                    // together; rendering after each NAL can overtake their decode.
++                    while (!_events.empty() && batch.size() < 64) {
++                        _queued_bytes -= _events.front().frame ? _events.front().frame->size() : 0;
++                        batch.emplace_back(std::move(_events.front()));
++                        _events.pop_front();
++                    }
++                    stopping = _stopping && _events.empty();
++                }
++                for (const auto &event : batch) { process(event); }
++                if (stopping) {
++                    finish(_stop_time);
++                    break;
++                }
++                if (_started) {
++                    auto ready_until = Clock::now();
++                    {
++                        std::lock_guard<std::mutex> lock(_mutex);
++                        // Do not write black over the time of unread input.
++                        if (!_events.empty()) {
++                            ready_until = std::min(ready_until, _events.front().received);
++                        }
++                        if (_stopping) {
++                            ready_until = std::min(ready_until, _stop_time);
++                        }
++                    }
++                    render(milliseconds(_start_time, ready_until) - _options.buffer_ms);
++                    if (_video_frame_index > 0) {
++                        std::lock_guard<std::mutex> lock(_mutex);
++                        if (_events.empty()) { _startup_queue = false; }
++                    }
++                }
++            }
++        } catch (const std::exception &error) {
++            _failed = true;
++            ErrorL << "record_gap_fill: recording stopped: " << error.what();
++        } catch (...) {
++            _failed = true;
++            ErrorL << "record_gap_fill: recording stopped by unknown error";
++        }
++        // Never call a decoder callback during member destruction. The worker
++        // drains normally in finish(); failed recordings are closed as-is.
++        _merger.clear();
++        _downstream.reset();
++    }
++
++    void process(const Event &event) {
++        switch (event.kind) {
++            case Event::TrackAdded: addInputTrack(event.track); break;
++            case Event::TracksComplete:
++                if (!_video_decoder) { throw std::runtime_error("video track required"); }
++                break;
++            case Event::FrameAdded: input(event.frame, event.received); break;
++            case Event::Reset:
++                finish(event.received);
++                reset();
++                _downstream->resetTracks();
++                break;
++            case Event::Flush:
++                _merger.flush();
++                _downstream->flush();
++                break;
++        }
++    }
++
++    void setExtra(AVCodecContext *decoder, const std::string &extra) {
++        if (extra.empty()) { return; }
++        decoder->extradata = static_cast<uint8_t *>(av_mallocz(extra.size() + AV_INPUT_BUFFER_PADDING_SIZE));
++        if (!decoder->extradata) { throw std::bad_alloc(); }
++        std::memcpy(decoder->extradata, extra.data(), extra.size());
++        decoder->extradata_size = static_cast<int>(extra.size());
++    }
++
++    void addInputTrack(const Track::Ptr &track) {
++        bool video = track->getTrackType() == TrackVideo;
++        if ((video && _video_decoder) || (!video && _audio_decoder)) {
++            throw std::runtime_error("only one video and one audio track are supported");
++        }
++        auto decoder = context(avcodec_find_decoder(inputCodec(track->getCodecId())));
++        decoder->thread_count = 1;
++        decoder->pkt_timebase = AVRational{1, 1000};
++        if (video) {
++            auto video_track = std::dynamic_pointer_cast<VideoTrack>(track);
++            if (!video_track) { throw std::runtime_error("invalid video track"); }
++            std::string extra;
++            for (auto &frame : video_track->getConfigFrames()) { extra.append(frame->data(), frame->size()); }
++            setExtra(decoder.get(), extra);
++            auto fps = video_track->getVideoFps();
++            _input_frame_ms = fps >= 1 && fps <= 120 ? 1000.0 / fps : 1000.0 / _options.fps;
++            _video_index = track->getIndex();
++        } else {
++            auto audio_track = std::dynamic_pointer_cast<AudioTrack>(track);
++            if (!audio_track) { throw std::runtime_error("invalid audio track"); }
++            auto extra = track->getExtraData();
++            if (extra) { setExtra(decoder.get(), std::string(extra->data(), extra->size())); }
++            decoder->sample_rate = audio_track->getAudioSampleRate();
++#if LIBAVUTIL_VERSION_MAJOR >= 57
++            av_channel_layout_default(&decoder->ch_layout, audio_track->getAudioChannel());
++#else
++            decoder->channels = audio_track->getAudioChannel();
++            decoder->channel_layout = av_get_default_channel_layout(decoder->channels);
++#endif
++            _audio_index = track->getIndex();
++        }
++        check(avcodec_open2(decoder.get(), decoder->codec, nullptr), "open input decoder");
++        if (video) { _video_decoder = std::move(decoder); }
++        else { _audio_decoder = std::move(decoder); }
++    }
++
++    void input(const Frame::Ptr &frame, Time received) {
++        if (_expired) { return; }
++        bool video = frame->getTrackType() == TrackVideo;
++        auto &decoder = video ? _video_decoder : _audio_decoder;
++        if (!decoder || frame->getIndex() != (video ? _video_index : _audio_index)) { return; }
++        auto &previous = video ? _last_video_input : _last_audio_input;
++        auto &last_dts = video ? _last_video_dts : _last_audio_dts;
++        const auto dts = static_cast<int64_t>(frame->dts());
++        const double idle_ms = previous == Time{} ? 0 : milliseconds(previous, received);
++        const double jump_ms = std::max(1000.0, _input_frame_ms * 4);
++        const bool new_sequence = video && idle_ms > jump_ms &&
++            (frame->configFrame() || frame->keyFrame());
++        const bool discontinuity = previous != Time{} &&
++            (dts < last_dts || new_sequence ||
++             (idle_ms > _options.buffer_ms && dts - last_dts > jump_ms));
++        // Receive jitter alone is not packet loss. Retain reference pictures
++        // across a pause if media DTS remains continuous, including B frames.
++        if (discontinuity) {
++            DebugL << "record_gap_fill: input timeline reset, video=" << video
++                   << ", idle_ms=" << idle_ms << ", dts_step=" << (dts - last_dts);
++            if (video) {
++                _merger.flush();
++                _waiting_keyframe = true;
++                _video_epoch_valid = false;
++            } else {
++                _audio_epoch_valid = false;
++                _resampler.reset();
++            }
++            avcodec_flush_buffers(decoder.get());
++        }
++        previous = received;
++        last_dts = dts;
++        _received = received;
++        if (video) {
++            if (_waiting_keyframe && !frame->keyFrame() && !frame->configFrame()) { return; }
++            if (frame->keyFrame()) { _waiting_keyframe = false; }
++            _merger.inputFrame(frame, [this](uint64_t dts, uint64_t pts, const Buffer::Ptr &buffer, bool) {
++                decode(_video_decoder.get(), buffer->data(), buffer->size(), dts, pts, true);
++            });
++        } else {
++            // ZLM AAC frames may contain ADTS; decoder extradata already carries ASC.
++            size_t prefix = frame->getCodecId() == CodecAAC ? frame->prefixSize() : 0;
++            if (prefix >= frame->size()) { return; }
++            decode(decoder.get(), frame->data() + prefix, frame->size() - prefix,
++                   frame->dts(), frame->pts(), false);
++        }
++    }
++
++    void decode(AVCodecContext *decoder, const char *data, size_t size,
++                uint64_t dts, uint64_t pts, bool video) {
++        Packet packet(av_packet_alloc());
++        if (!packet) { throw std::bad_alloc(); }
++        if (size > 16 * 1024 * 1024) { throw std::runtime_error("input packet too large"); }
++        check(av_new_packet(packet.get(), static_cast<int>(size)), "allocate input packet");
++        std::memcpy(packet->data, data, size);
++        packet->dts = static_cast<int64_t>(dts);
++        packet->pts = static_cast<int64_t>(pts);
++        int result = avcodec_send_packet(decoder, packet.get());
++        if (result == AVERROR(EAGAIN)) {
++            receiveDecoded(decoder, video);
++            result = avcodec_send_packet(decoder, packet.get());
++        }
++        // A damaged source frame should lead to black/silence, not a stopped recording.
++        if (result == AVERROR_INVALIDDATA) { return; }
++        check(result, "send input packet");
++        receiveDecoded(decoder, video);
++    }
++
++    void receiveDecoded(AVCodecContext *decoder, bool video) {
++        while (true) {
++            auto decoded = picture();
++            int result = avcodec_receive_frame(decoder, decoded.get());
++            if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) { break; }
++            if (result == AVERROR_INVALIDDATA) { break; }
++            check(result, "receive decoded frame");
++            if (video) { onVideo(decoded); }
++            else if (_started) { onAudio(decoded); }
++        }
++    }
++
++    double mapTime(bool video, int64_t pts) {
++        bool &valid = video ? _video_epoch_valid : _audio_epoch_valid;
++        int64_t &source = video ? _video_epoch_source : _audio_epoch_source;
++        double &target = video ? _video_epoch_ms : _audio_epoch_ms;
++        double now = milliseconds(_start_time, _received);
++        // Network gaps and source timestamp resets start a new input epoch;
++        // the output clock is never reset. Upstream may already normalize RTMP stamps.
++        if (!valid || pts == AV_NOPTS_VALUE || std::abs(target + pts - source - now) > _options.buffer_ms * 2 + 250) {
++            if (valid && pts != AV_NOPTS_VALUE) {
++                DebugL << "record_gap_fill: clock reanchor, sink=" << this << ", video=" << video
++                       << ", pts=" << pts << ", mapped_ms=" << (target + pts - source)
++                       << ", received_ms=" << now << ", output_ms=" << videoMs()
++                       << ", discarded=" << (video ? _pictures.size() : _audio_chunks.size());
++            }
++            // Cached GOP replay advances media PTS by seconds while its receive
++            // clock barely moves. Once this mapping changes, queued pictures /
++            // audio still carry the old mapping and must not accumulate across
++            // epochs or be played over the newly aligned live input.
++            if (video) { _pictures.clear(); }
++            else { _audio_chunks.clear(); }
++            valid = true;
++            source = pts == AV_NOPTS_VALUE ? 0 : pts;
++            // Before any video has been written, a new startup mapping must
++            // still cover t=0. Otherwise clearing pre-roll received a few ms
++            // later leaves the very first output tick without a real picture.
++            target = video && _video_frame_index == 0 ? 0 : now;
++        }
++        return pts == AV_NOPTS_VALUE ? now : target + pts - source;
++    }
++
++    void onVideo(const Picture &decoded) {
++        if (!_video_encoder) { openOutput(decoded->width, decoded->height); }
++        if (!_started) {
++            _start_time = _received;
++            _started = true;
++        }
++        double stamp = mapTime(true, decoded->best_effort_timestamp);
++        _last_valid_ms = std::max(_last_valid_ms, milliseconds(_start_time, _received));
++        if (stamp + _input_frame_ms < videoMs()) {
++            if (!_late_video_frames++) {
++                DebugL << "record_gap_fill: decoded picture too late, sink=" << this
++                       << ", picture_ms=" << stamp << ", output_ms=" << videoMs()
++                       << ", received_ms=" << milliseconds(_start_time, _received);
++            }
++            return; // Too late for already written samples.
++        }
++        if (_late_video_frames) {
++            DebugL << "record_gap_fill: decoded picture caught up, sink=" << this
++                   << ", late_frames=" << _late_video_frames;
++            _late_video_frames = 0;
++        }
++        auto converted = picture();
++        converted->format = AV_PIX_FMT_YUV420P;
++        converted->width = _width;
++        converted->height = _height;
++        check(av_frame_get_buffer(converted.get(), 32), "allocate scaled picture");
++        auto scaler = sws_getCachedContext(_scaler.release(), decoded->width, decoded->height,
++            static_cast<AVPixelFormat>(decoded->format), _width, _height, AV_PIX_FMT_YUV420P,
++            SWS_BILINEAR, nullptr, nullptr, nullptr);
++        _scaler.reset(scaler);
++        if (!scaler) { throw std::runtime_error("create video scaler failed"); }
++        if (sws_scale(scaler, decoded->data, decoded->linesize, 0, decoded->height,
++                      converted->data, converted->linesize) != _height) {
++            throw std::runtime_error("scale video failed");
++        }
++        if (_pictures.size() >= 120) { throw std::runtime_error("decoded video queue overflow"); }
++        auto position = std::upper_bound(_pictures.begin(), _pictures.end(), stamp,
++            [](double time, const TimedPicture &item) { return time < item.time_ms; });
++        _pictures.insert(position, TimedPicture{stamp, std::move(converted)});
++    }
++
++    void openOutput(int width, int height) {
++        if (width < 16 || height < 16 || width > 4096 || height > 4096 || width % 2 || height % 2) {
++            throw std::runtime_error("video size must be even and within 16..4096");
++        }
++        _width = width;
++        _height = height;
++        _video_encoder = context(avcodec_find_encoder_by_name("libx264"));
++        auto video = _video_encoder.get();
++        video->width = width;
++        video->height = height;
++        video->pix_fmt = AV_PIX_FMT_YUV420P;
++        video->time_base = AVRational{1, _options.fps};
++        video->framerate = AVRational{_options.fps, 1};
++        video->gop_size = _options.fps * 2;
++        video->max_b_frames = 0;
++        video->bit_rate = _options.bitrate;
++        video->thread_count = 1;
++        video->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
++        check(av_opt_set(video->priv_data, "preset", "veryfast", 0), "set x264 preset");
++        check(av_opt_set(video->priv_data, "tune", "zerolatency", 0), "set x264 tune");
++        check(avcodec_open2(video, video->codec, nullptr), "open H264 encoder");
++        auto video_track = Factory::getTrackByCodecId(CodecH264);
++        video_track->setIndex(0);
++        splitH264(reinterpret_cast<const char *>(video->extradata), video->extradata_size,
++            prefixSize(reinterpret_cast<const char *>(video->extradata), video->extradata_size),
++            [&](const char *data, size_t bytes, size_t) {
++                video_track->inputFrame(Factory::getFrameFromPtr(CodecH264, data, bytes, 0, 0));
++            });
++        if (!video_track->ready() || !_downstream->addTrack(video_track)) {
++            throw std::runtime_error("register output H264 track failed");
++        }
++
++        _black = picture();
++        _black->format = video->pix_fmt;
++        _black->width = width;
++        _black->height = height;
++        check(av_frame_get_buffer(_black.get(), 32), "allocate black picture");
++        for (int plane = 0; plane < 3; ++plane) {
++            int rows = plane == 0 ? height : height / 2;
++            for (int row = 0; row < rows; ++row) {
++                std::memset(_black->data[plane] + row * _black->linesize[plane], plane == 0 ? 16 : 128,
++                            plane == 0 ? width : width / 2);
++            }
++        }
++        if (_options.audio) { openAudioOutput(); }
++        _downstream->addTrackCompleted();
++    }
++
++    void openAudioOutput() {
++        _audio_encoder = context(avcodec_find_encoder_by_name("aac"));
++        auto audio = _audio_encoder.get();
++        audio->sample_rate = 48000;
++        audio->sample_fmt = AV_SAMPLE_FMT_FLTP;
++        audio->time_base = AVRational{1, 48000};
++        audio->bit_rate = 128000;
++        audio->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
++#if LIBAVUTIL_VERSION_MAJOR >= 57
++        av_channel_layout_default(&audio->ch_layout, 2);
++#else
++        audio->channels = 2;
++        audio->channel_layout = AV_CH_LAYOUT_STEREO;
++#endif
++        check(avcodec_open2(audio, audio->codec, nullptr), "open AAC encoder");
++        if (audio->frame_size <= 0) { throw std::runtime_error("AAC encoder has no fixed frame size"); }
++        auto track = Factory::getTrackByCodecId(CodecAAC);
++        track->setIndex(1);
++        track->setExtraData(audio->extradata, audio->extradata_size);
++        if (!track->ready() || !_downstream->addTrack(track)) { throw std::runtime_error("register output AAC track failed"); }
++    }
++
++    void onAudio(const Picture &decoded) {
++        if (!_options.audio) { return; }
++        // Reconfigure on source format changes; the output remains stereo/48kHz/FLTP.
++#if LIBAVUTIL_VERSION_MAJOR >= 57
++        std::string layout;
++        char description[128];
++        av_channel_layout_describe(&decoded->ch_layout, description, sizeof(description));
++        layout = description;
++#else
++        std::string layout = std::to_string(decoded->channel_layout ? decoded->channel_layout :
++                                                       av_get_default_channel_layout(decoded->channels));
++#endif
++        std::string format = layout + "/" + std::to_string(decoded->sample_rate) + "/" + std::to_string(decoded->format);
++        if (!_resampler || format != _resample_format) {
++            _resampler.reset();
++            SwrContext *resampler = nullptr;
++#if LIBAVUTIL_VERSION_MAJOR >= 57
++            AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
++            check(swr_alloc_set_opts2(&resampler, &stereo, AV_SAMPLE_FMT_FLTP, 48000,
++                  &decoded->ch_layout, static_cast<AVSampleFormat>(decoded->format), decoded->sample_rate, 0, nullptr), "create resampler");
++#else
++            resampler = swr_alloc_set_opts(nullptr, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_FLTP, 48000,
++                decoded->channel_layout ? decoded->channel_layout : av_get_default_channel_layout(decoded->channels),
++                static_cast<AVSampleFormat>(decoded->format), decoded->sample_rate, 0, nullptr);
++#endif
++            _resampler.reset(resampler);
++            if (!resampler) { throw std::bad_alloc(); }
++            check(swr_init(resampler), "initialize resampler");
++            _resample_format = std::move(format);
++        }
++        auto converted = picture();
++        converted->format = AV_SAMPLE_FMT_FLTP;
++        converted->sample_rate = 48000;
++#if LIBAVUTIL_VERSION_MAJOR >= 57
++        av_channel_layout_default(&converted->ch_layout, 2);
++#else
++        converted->channel_layout = AV_CH_LAYOUT_STEREO;
++        converted->channels = 2;
++#endif
++        check(swr_convert_frame(_resampler.get(), converted.get(), decoded.get()), "resample audio");
++        int64_t start = static_cast<int64_t>(std::llround(mapTime(false, decoded->pts) * 48));
++        if (start + converted->nb_samples <= _audio_sample_index) { return; }
++        if (_audio_chunks.size() >= 256) { throw std::runtime_error("decoded audio queue overflow"); }
++        auto position = std::upper_bound(_audio_chunks.begin(), _audio_chunks.end(), start,
++            [](int64_t sample, const AudioChunk &item) { return sample < item.start; });
++        _audio_chunks.insert(position, AudioChunk{start, std::move(converted)});
++    }
++
++    double videoMs() const { return _video_frame_index * 1000.0 / _options.fps; }
++    double audioMs() const { return _audio_sample_index / 48.0; }
++
++    void render(double end_ms) {
++        if (!_started || _expired) { return; }
++        double deadline = _last_valid_ms + _options.max_ms;
++        end_ms = std::min(end_ms, deadline);
++        if (end_ms - videoMs() > 2000) { throw std::runtime_error("encoding fell more than 2 seconds behind real time"); }
++        while (videoMs() < end_ms || (_audio_encoder && audioMs() < end_ms)) {
++            if (videoMs() < end_ms && (!_audio_encoder || videoMs() <= audioMs())) {
++                double stamp = videoMs();
++                while (!_pictures.empty() && _pictures.front().time_ms <= stamp + 0.5) {
++                    _current = std::move(_pictures.front());
++                    _pictures.pop_front();
++                }
++                // Hold the last picture through the configured jitter window.
++                // A missing decode for one output tick must not flash black.
++                // Longer outages still become black; the output clock continues.
++                const double coverage = std::max<double>(_options.buffer_ms,
++                    std::max(_input_frame_ms, 1000.0 / _options.fps)) + 2;
++                bool real = _current.frame && stamp < _current.time_ms + coverage;
++                if (real != _rendering_real) {
++                    DebugL << "record_gap_fill: " << (real ? "picture recovered" : "black started")
++                           << ", sink=" << this << ", output_ms=" << stamp
++                           << ", picture_ms=" << _current.time_ms << ", pending=" << _pictures.size()
++                           << ", video_received_ms=" << milliseconds(_start_time, _last_video_input);
++                    _rendering_real = real;
++                }
++                auto selected = real ? _current.frame : _black;
++                selected->pts = _video_frame_index++;
++                encode(_video_encoder.get(), selected.get(), true);
++            } else if (_audio_encoder && audioMs() < end_ms) {
++                encodeAudio();
++            } else {
++                break;
++            }
++        }
++        if (end_ms >= deadline) {
++            drainEncoders();
++            _downstream->flush();
++            _expired = true;
++            WarnL << "record_gap_fill: idle limit reached; recording paused until track reset or a new media source";
++        }
++    }
++
++    void encodeAudio() {
++        auto audio = picture();
++        audio->format = AV_SAMPLE_FMT_FLTP;
++        audio->sample_rate = 48000;
++        audio->nb_samples = _audio_encoder->frame_size;
++#if LIBAVUTIL_VERSION_MAJOR >= 57
++        av_channel_layout_default(&audio->ch_layout, 2);
++#else
++        audio->channels = 2;
++        audio->channel_layout = AV_CH_LAYOUT_STEREO;
++#endif
++        check(av_frame_get_buffer(audio.get(), 0), "allocate output audio");
++        for (int channel = 0; channel < 2; ++channel) {
++            std::memset(audio->data[channel], 0, audio->nb_samples * sizeof(float));
++        }
++        int64_t end = _audio_sample_index + audio->nb_samples;
++        while (!_audio_chunks.empty() && _audio_chunks.front().start + _audio_chunks.front().frame->nb_samples <= _audio_sample_index) {
++            _audio_chunks.pop_front();
++        }
++        for (auto &chunk : _audio_chunks) {
++            if (chunk.start >= end) { break; }
++            int64_t from = std::max(_audio_sample_index, chunk.start);
++            int64_t to = std::min(end, chunk.start + chunk.frame->nb_samples);
++            if (from >= to) { continue; }
++            for (int channel = 0; channel < 2; ++channel) {
++                std::memcpy(reinterpret_cast<float *>(audio->data[channel]) + from - _audio_sample_index,
++                    reinterpret_cast<float *>(chunk.frame->data[channel]) + from - chunk.start,
++                    (to - from) * sizeof(float));
++            }
++        }
++        audio->pts = _audio_sample_index;
++        _audio_sample_index = end;
++        encode(_audio_encoder.get(), audio.get(), false);
++    }
++
++    void encode(AVCodecContext *encoder, AVFrame *frame, bool video) {
++        int result = avcodec_send_frame(encoder, frame);
++        if (result == AVERROR(EAGAIN)) {
++            receiveEncoded(encoder, video);
++            result = avcodec_send_frame(encoder, frame);
++        }
++        if (result != AVERROR_EOF) { check(result, "send output frame"); }
++        receiveEncoded(encoder, video);
++    }
++
++    void receiveEncoded(AVCodecContext *encoder, bool video) {
++        Packet packet(av_packet_alloc());
++        if (!packet) { throw std::bad_alloc(); }
++        while (true) {
++            int result = avcodec_receive_packet(encoder, packet.get());
++            if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) { break; }
++            check(result, "receive output packet");
++            // AAC's negative priming packet cannot be represented by Frame's
++            // unsigned timestamps. Drop it; normal output starts at zero.
++            if (packet->pts >= 0 && packet->dts >= 0) {
++                auto dts = av_rescale_q(packet->dts, encoder->time_base, AVRational{1, 1000});
++                auto pts = av_rescale_q(packet->pts, encoder->time_base, AVRational{1, 1000});
++                auto emit = [&](const char *data, size_t bytes) {
++                    auto buffer = std::make_shared<BufferString>(std::string(data, bytes));
++                    auto frame = Factory::getFrameFromBuffer(video ? CodecH264 : CodecAAC, buffer, dts, pts);
++                    frame->setIndex(video ? 0 : 1);
++                    _downstream->inputFrame(frame);
++                };
++                if (video) {
++                    auto data = reinterpret_cast<const char *>(packet->data);
++                    splitH264(data, packet->size, prefixSize(data, packet->size),
++                        [&](const char *nal, size_t bytes, size_t) { emit(nal, bytes); });
++                } else { emit(reinterpret_cast<const char *>(packet->data), packet->size); }
++            }
++            av_packet_unref(packet.get());
++        }
++    }
++
++    void drainEncoders() {
++        if (_video_encoder) { encode(_video_encoder.get(), nullptr, true); }
++        if (_audio_encoder) { encode(_audio_encoder.get(), nullptr, false); }
++    }
++
++    void finish(Time end) {
++        if (_expired) { return; }
++        _merger.flush();
++        if (!_started) { return; }
++        if (_video_decoder) {
++            avcodec_send_packet(_video_decoder.get(), nullptr);
++            receiveDecoded(_video_decoder.get(), true);
++        }
++        if (_audio_decoder) {
++            avcodec_send_packet(_audio_decoder.get(), nullptr);
++            receiveDecoded(_audio_decoder.get(), false);
++        }
++        render(milliseconds(_start_time, end));
++        if (!_expired) { drainEncoders(); }
++        _downstream->flush();
++    }
++
++    void reset() {
++        _merger.clear();
++        _video_decoder.reset();
++        _audio_decoder.reset();
++        _video_encoder.reset();
++        _audio_encoder.reset();
++        _resampler.reset();
++        _scaler.reset();
++        _black.reset();
++        _current = {};
++        _pictures.clear();
++        _audio_chunks.clear();
++        _started = _expired = false;
++        _rendering_real = true;
++        _waiting_keyframe = true;
++        _video_epoch_valid = _audio_epoch_valid = false;
++        _last_video_input = _last_audio_input = {};
++        _last_video_dts = _last_audio_dts = 0;
++        _video_frame_index = _audio_sample_index = 0;
++        _last_valid_ms = 0;
++        _late_video_frames = 0;
++    }
++
++    MediaSinkInterface::Ptr _downstream;
++    Options _options;
++    std::mutex _mutex;
++    std::condition_variable _condition;
++    std::deque<Event> _events;
++    size_t _queued_bytes = 0;
++    bool _startup_queue = true; // Protected by _mutex; reset on queued track reset.
++    bool _stopping = false;
++    std::atomic<bool> _failed{false};
++    Time _stop_time;
++    std::thread _thread;
++
++    Context _video_decoder, _audio_decoder, _video_encoder, _audio_encoder;
++    std::unique_ptr<SwrContext, SwrFree> _resampler;
++    std::unique_ptr<SwsContext, SwsFree> _scaler;
++    std::string _resample_format;
++    FrameMerger _merger{FrameMerger::h264_prefix};
++    int _video_index = -1, _audio_index = -1;
++    int _width = 0, _height = 0;
++    bool _started = false, _expired = false, _waiting_keyframe = true;
++    bool _rendering_real = true;
++    bool _video_epoch_valid = false, _audio_epoch_valid = false;
++    int64_t _video_epoch_source = 0, _audio_epoch_source = 0;
++    double _video_epoch_ms = 0, _audio_epoch_ms = 0;
++    Time _start_time, _received, _last_video_input, _last_audio_input;
++    int64_t _last_video_dts = 0, _last_audio_dts = 0;
++    double _last_valid_ms = 0, _input_frame_ms = 40;
++    int64_t _video_frame_index = 0, _audio_sample_index = 0;
++    size_t _late_video_frames = 0;
++    Picture _black;
++    TimedPicture _current{};
++    std::deque<TimedPicture> _pictures;
++    std::deque<AudioChunk> _audio_chunks;
++};
++#endif
++} // namespace
++
++MediaSinkInterface::Ptr wrapRecordGapFiller(MediaSinkInterface::Ptr recorder,
++                                          uint32_t retention_ms,
++                                          bool audio_enabled) {
++    auto &ini = mINI::Instance();
++    if (!ini[kEnable].as<bool>()) { return recorder; }
++#if defined(ENABLE_MP4) && defined(ENABLE_FFMPEG)
++    auto buffer_ms = ini[kDetect].as<int>();
++    auto max_ms = ini[kMax].as<int>();
++    auto fps = ini[kFps].as<int>();
++    auto bitrate = ini[kBitrate].as<int>();
++    if (!recorder || retention_ms == 0 || buffer_ms < 40 || buffer_ms > 2000 ||
++        max_ms <= buffer_ms || max_ms > 600000 || fps < 5 || fps > 60 || bitrate < 64000 || bitrate > 100000000) {
++        throw std::invalid_argument("record_gap_fill: invalid settings; require retention>0, detect_ms=40..2000, max_ms>detect_ms and <=600000, fps=5..60, bitrate=64000..100000000");
++    }
++    if (!avcodec_find_encoder_by_name("libx264") || (audio_enabled && !avcodec_find_encoder_by_name("aac"))) {
++        throw std::invalid_argument("record_gap_fill requires FFmpeg libx264 and AAC encoders");
++    }
++    // This is a local idle cap, NOT the RTMP disconnect deadline: their start
++    // times differ. Source destruction always ends the wrapper independently.
++    max_ms = static_cast<int>(std::min<uint32_t>(max_ms, retention_ms));
++    if (max_ms <= buffer_ms) { throw std::invalid_argument("record_gap_fill: retention must exceed detect_ms"); }
++    return std::make_shared<RecordGapFiller>(std::move(recorder), Options{buffer_ms, max_ms, fps, bitrate, audio_enabled});
++#else
++    (void)retention_ms;
++    (void)audio_enabled;
++    throw std::invalid_argument("record_gap_fill requires ENABLE_MP4 and ENABLE_FFMPEG; feature is disabled by default");
++#endif
++}
++
++
++#if defined(ENABLE_HLS) && defined(ENABLE_MP4) && defined(ENABLE_FFMPEG)
++namespace {
++
++// 状态独立于 HlsRecorder；输出任务不会持有外层裸 this。
++struct TsDelivery : public std::enable_shared_from_this<TsDelivery> {
++    TsDelivery(toolkit::EventPoller::Ptr executor,
++               TsGapInput::OnPacket callback)
++        : owner(std::move(executor)),
++          output(std::move(callback)) {}
++
++    void post(toolkit::Buffer::Ptr buffer,
++              uint64_t stamp, bool key) {
++        const size_t max_bytes = 32 * 1024 * 1024;
++        const size_t bytes = buffer ? buffer->size() : 0;
++        const size_t old_count = pending.fetch_add(1);
++        const size_t old_bytes = pending_bytes.fetch_add(bytes);
++
++        if (failed.load() || old_count >= 256 ||
++            bytes > max_bytes || old_bytes > max_bytes - bytes) {
++            pending.fetch_sub(1);
++            pending_bytes.fetch_sub(bytes);
++            failed = true;
++            throw std::runtime_error("TS output queue full or failed");
++        }
++
++        auto self = shared_from_this();
++        try {
++            owner->async([self, buffer, stamp, key, bytes]() {
++                try {
++                    if (!self->failed.load()) {
++                        self->output(buffer, stamp, key);
++                    }
++                } catch (const std::exception &ex) {
++                    self->failed = true;
++                    ErrorL << "TS output failed: " << ex.what();
++                } catch (...) {
++                    self->failed = true;
++                    ErrorL << "TS output failed: unknown exception";
++                }
++                self->pending.fetch_sub(1);
++                self->pending_bytes.fetch_sub(bytes);
++            }, false);
++        } catch (...) {
++            pending.fetch_sub(1);
++            pending_bytes.fetch_sub(bytes);
++            failed = true;
++            throw;
++        }
++    }
++
++    toolkit::EventPoller::Ptr owner;
++    TsGapInput::OnPacket output;
++    std::atomic<size_t> pending {0};
++    std::atomic<size_t> pending_bytes {0};
++    std::atomic<bool> failed {false};
++};
++
++// 只在补帧线程操作；不访问 HlsRecorder/HlsMakerImp。
++class GapTsSink final : public MpegMuxer {
++public:
++    explicit GapTsSink(std::shared_ptr<TsDelivery> delivery)
++        : _delivery(std::move(delivery)) {}
++
++    ~GapTsSink() override {
++        try {
++            MpegMuxer::flush();
++        } catch (const std::exception &ex) {
++            WarnL << ex.what();
++        }
++    }
++
++    bool addTrack(const Track::Ptr &track) override {
++        if (track->getTrackType() == TrackVideo) {
++            auto video = std::dynamic_pointer_cast<VideoTrack>(track);
++            if (!video) {
++                throw std::runtime_error("invalid TS video track");
++            }
++            _video_config = video->getConfigFrames();
++        }
++
++        if (track->getCodecId() == CodecAAC) {
++            _aac = std::dynamic_pointer_cast<AACTrack>(track->clone());
++            if (!_aac || !_aac->ready()) {
++                throw std::runtime_error("AAC output config not ready");
++            }
++            _aac->addDelegate([this](const Frame::Ptr &frame) {
++                return MpegMuxer::inputFrame(frame);
++            });
++        }
++
++        return MpegMuxer::addTrack(track);
++    }
++
++    bool inputFrame(const Frame::Ptr &frame) override {
++        if (frame->getCodecId() == CodecAAC &&
++            frame->prefixSize() == 0) {
++            if (!_aac) {
++                throw std::runtime_error("missing AAC output track");
++            }
++            return _aac->inputFrame(frame);
++        }
++
++        if (frame->getTrackType() == TrackVideo && frame->keyFrame()) {
++            for (const auto &config : _video_config) {
++                auto buffer = std::make_shared<toolkit::BufferString>(
++                    std::string(config->data(), config->size()));
++                auto header = Factory::getFrameFromBuffer(
++                    frame->getCodecId(), buffer,
++                    frame->dts(), frame->pts());
++                header->setIndex(frame->getIndex());
++                MpegMuxer::inputFrame(header);
++            }
++        }
++        return MpegMuxer::inputFrame(frame);
++    }
++
++    void resetTracks() override {
++        MpegMuxer::flush();
++        MpegMuxer::resetTracks();
++        _aac.reset();
++        _video_config.clear();
++    }
++
++private:
++    void onWrite(toolkit::Buffer::Ptr buffer,
++                 uint64_t stamp, bool key) override {
++        _delivery->post(std::move(buffer), stamp, key);
++    }
++
++    std::shared_ptr<TsDelivery> _delivery;
++    AACTrack::Ptr _aac;
++    std::vector<Frame::Ptr> _video_config;
++};
++
++// 前端方法由流所属线程调用。
++class TsGapInputImpl final : public TsGapInput {
++public:
++    TsGapInputImpl(uint32_t retention_ms, bool audio)
++        : _retention_ms(retention_ms), _audio(audio) {}
++
++    ~TsGapInputImpl() override {
++        stop();
++    }
++
++    void bindOutput(const toolkit::EventPoller::Ptr &owner,
++                    OnPacket output) override {
++        if (_stopped) {
++            throw std::runtime_error("TS gap input already stopped");
++        }
++        if (_delivery) {
++            return; // 重复设置监听器不重建处理线程。
++        }
++        if (!owner || !output) {
++            throw std::invalid_argument("invalid TS output binding");
++        }
++        _delivery = std::make_shared<TsDelivery>(
++            owner, std::move(output));
++        startIfReady();
++    }
++
++    bool addTrack(const Track::Ptr &track) override {
++        if (_stopped) {
++            return false;
++        }
++        if (_input) {
++            return _input->addTrack(track);
++        }
++        _tracks.emplace_back(track->clone());
++        return true;
++    }
++
++    void addTrackCompleted() override {
++        if (_stopped) {
++            return;
++        }
++        _tracks_ready = true;
++        if (_input) {
++            _input->addTrackCompleted();
++        } else {
++            startIfReady();
++        }
++    }
++
++    bool inputFrame(const Frame::Ptr &frame) override {
++        if (_stopped || (_delivery && _delivery->failed.load())) {
++            return false;
++        }
++        if (_input) {
++            return _input->inputFrame(frame);
++        }
++
++        const size_t max_bytes = 32 * 1024 * 1024;
++        if (_pending.size() >= kStartupInputEvents ||
++            frame->size() > max_bytes - _pending_bytes) {
++            throw std::runtime_error("TS startup queue full");
++        }
++        _pending.emplace_back(Frame::getCacheAbleFrame(frame));
++        _pending_bytes += frame->size();
++        return true;
++    }
++
++    void resetTracks() override {
++        if (_stopped) {
++            return;
++        }
++        _tracks.clear();
++        _pending.clear();
++        _pending_bytes = 0;
++        _tracks_ready = false;
++        if (_input) {
++            _input->resetTracks();
++        }
++    }
++
++    void flush() override {
++        if (_input) {
++            _input->flush();
++        }
++    }
++
++    void stop() noexcept override {
++        if (_stopped) {
++            return;
++        }
++        _stopped = true;
++        // 现有 RecordGapFiller 的析构会停止并 join 工作线程。
++        // 工作线程不会等待输出 EventPoller，因此没有互相等待。
++        _input.reset();
++        _tracks.clear();
++        _pending.clear();
++        _pending_bytes = 0;
++        // 已排队任务持有自己的 delivery 和输出目标引用。
++        _delivery.reset();
++    }
++
++private:
++    void startIfReady() {
++        if (_stopped || _input || !_delivery || !_tracks_ready) {
++            return;
++        }
++
++        auto sink = std::make_shared<GapTsSink>(_delivery);
++        auto input = wrapRecordGapFiller(
++            sink, _retention_ms, _audio);
++
++        for (const auto &track : _tracks) {
++            if (!input->addTrack(track)) {
++                throw std::runtime_error("TS input rejected track");
++            }
++        }
++        input->addTrackCompleted();
++
++        for (const auto &frame : _pending) {
++            if (!input->inputFrame(frame)) {
++                throw std::runtime_error("TS input queue full");
++            }
++        }
++
++        _input = std::move(input);
++        _tracks.clear();
++        _pending.clear();
++        _pending_bytes = 0;
++    }
++
++    uint32_t _retention_ms;
++    bool _audio;
++    bool _stopped = false;
++    bool _tracks_ready = false;
++    std::shared_ptr<TsDelivery> _delivery;
++    MediaSinkInterface::Ptr _input;
++    std::vector<Track::Ptr> _tracks;
++    std::deque<Frame::Ptr> _pending;
++    size_t _pending_bytes = 0;
++};
++
++} // namespace
++#endif
++
++TsGapInput::Ptr createTsGapInput(
++    uint32_t retention_ms, bool audio_enabled) {
++    if (!toolkit::mINI::Instance()
++             ["record_gap_fill.enable"].as<bool>()) {
++        return nullptr;
++    }
++#if defined(ENABLE_HLS) && defined(ENABLE_MP4) && defined(ENABLE_FFMPEG)
++    return std::make_shared<TsGapInputImpl>(
++        retention_ms, audio_enabled);
++#else
++    throw std::invalid_argument(
++        "TS gap fill requires ENABLE_HLS, ENABLE_MP4 and ENABLE_FFMPEG");
++#endif
++}
++
++} // namespace mediakit
+diff --git a/tests/test_record_gap_fill.cpp b/tests/test_record_gap_fill.cpp
+new file mode 100644
+index 00000000..0e8ab643
+--- /dev/null
++++ b/tests/test_record_gap_fill.cpp
+@@ -0,0 +1,443 @@
++/* Copyright (c) ZLMediaKit contributors. SPDX-License-Identifier: MIT */
++#include "Extension/RecordGapFiller.h"
++#include "Extension/Factory.h"
++#include "Common/config.h"
++#include "ext-codec/H264.h"
++
++#include <atomic>
++#include <chrono>
++#include <cstring>
++#include <functional>
++#include <future>
++#include <iostream>
++#include <stdexcept>
++#include <thread>
++#include <vector>
++
++#if defined(__linux__) && !defined(ANDROID)
++#include <pthread.h>
++#include <sched.h>
++#endif
++
++#if defined(ENABLE_MP4) && defined(ENABLE_FFMPEG)
++extern "C" {
++#include <libavcodec/avcodec.h>
++}
++#endif
++
++using namespace mediakit;
++using namespace toolkit;
++
++namespace {
++
++void require(bool condition, const char *message) {
++    if (!condition) {
++        throw std::runtime_error(message);
++    }
++}
++
++class Capture final : public MediaSinkInterface {
++public:
++    bool addTrack(const Track::Ptr &track) override {
++        if (before_track) { before_track(); }
++#if defined(__linux__) && !defined(ANDROID)
++        worker_policy = sched_getscheduler(0);
++        require(sched_getaffinity(0, sizeof(worker_cpus), &worker_cpus) == 0,
++                "cannot inspect worker CPU affinity");
++#endif
++        tracks.emplace_back(track->clone());
++        return true;
++    }
++    bool inputFrame(const Frame::Ptr &frame) override {
++        frames.emplace_back(Frame::getCacheAbleFrame(frame));
++        return true;
++    }
++    void resetTracks() override { ++resets; }
++    void flush() override { ++flushes; }
++
++    std::vector<Track::Ptr> tracks;
++    std::vector<Frame::Ptr> frames;
++    int resets = 0;
++    int flushes = 0;
++    std::function<void()> before_track;
++#if defined(__linux__) && !defined(ANDROID)
++    int worker_policy = -1;
++    cpu_set_t worker_cpus{};
++#endif
++};
++
++#if defined(ENABLE_MP4) && defined(ENABLE_FFMPEG)
++
++std::string source() {
++    const std::string hex =
++        "000000016742c00adc426c0440000003004000000ca3c489e0"
++        "0000000168ce0fc8"
++        "0000016588843a26280008f649c9c9d75d75d75d75d75d75e0";
++    std::string bytes;
++    for (size_t index = 0; index < hex.size(); index += 2) {
++        bytes.push_back(static_cast<char>(std::stoi(hex.substr(index, 2), nullptr, 16)));
++    }
++    return bytes;
++}
++
++Track::Ptr inputTrack() {
++    auto track = Factory::getTrackByCodecId(CodecH264);
++    auto bytes = source();
++    splitH264(bytes.data(), bytes.size(), 4,
++        [&](const char *data, size_t size, size_t) {
++            track->inputFrame(Factory::getFrameFromPtr(CodecH264, data, size, 0, 0));
++        });
++    track->setIndex(0);
++    require(track->ready(), "H.264 fixture is not ready");
++    return track;
++}
++
++void feed(const MediaSinkInterface::Ptr &sink, int count) {
++    auto bytes = source();
++    auto begin = std::chrono::steady_clock::now();
++    for (int index = 0; index < count; ++index) {
++        splitH264(bytes.data(), bytes.size(), 4,
++            [&](const char *data, size_t size, size_t) {
++                auto buffer = std::make_shared<BufferString>(std::string(data, size));
++                auto frame = Factory::getFrameFromBuffer(CodecH264, buffer, index * 40, index * 40);
++                frame->setIndex(0);
++                require(sink->inputFrame(frame), "normal input rejected");
++            });
++        std::this_thread::sleep_until(begin + std::chrono::milliseconds((index + 1) * 40));
++    }
++}
++
++size_t countBlackFrames(const Capture &capture) {
++    auto codec = avcodec_find_decoder(AV_CODEC_ID_H264);
++    std::unique_ptr<AVCodecContext, std::function<void(AVCodecContext *)>> decoder(
++        avcodec_alloc_context3(codec), [](AVCodecContext *value) { avcodec_free_context(&value); });
++    require(decoder && avcodec_open2(decoder.get(), codec, nullptr) == 0, "open output decoder");
++    std::string headers;
++    auto video = std::dynamic_pointer_cast<VideoTrack>(capture.tracks.at(0));
++    for (const auto &config : video->getConfigFrames()) {
++        headers.append(config->data(), config->size());
++    }
++    size_t black = 0, pictures = 0;
++    auto receive = [&]() {
++        AVFrame *frame = av_frame_alloc();
++        while (avcodec_receive_frame(decoder.get(), frame) == 0) {
++            ++pictures;
++            if (frame->data[0][0] < 30) { ++black; }
++            av_frame_unref(frame);
++        }
++        av_frame_free(&frame);
++    };
++    FrameMerger merger(FrameMerger::h264_prefix);
++    bool first = true;
++    auto decode = [&](uint64_t, uint64_t, const Buffer::Ptr &buffer, bool) {
++        std::string bytes = first ? headers : std::string();
++        first = false;
++        bytes.append(buffer->data(), buffer->size());
++        AVPacket *packet = av_packet_alloc();
++        require(av_new_packet(packet, bytes.size()) == 0, "allocate output packet");
++        std::memcpy(packet->data, bytes.data(), bytes.size());
++        auto result = avcodec_send_packet(decoder.get(), packet);
++        av_packet_free(&packet);
++        require(result >= 0, "decode output packet");
++        receive();
++    };
++    for (const auto &frame : capture.frames) {
++        if (frame->getTrackType() == TrackVideo) {
++            merger.inputFrame(frame, decode);
++        }
++    }
++    merger.flush();
++    require(avcodec_send_packet(decoder.get(), nullptr) == 0, "drain output decoder");
++    receive();
++    require(pictures >= 10, "too few decoded output pictures");
++    return black;
++}
++
++void testContinuousLowFrameRate() {
++    auto &ini = mINI::Instance();
++    ini["record_gap_fill.detect_ms"] = 200;
++    auto capture = std::make_shared<Capture>();
++    auto sink = wrapRecordGapFiller(capture, 2000, false);
++    sink->addTrack(inputTrack());
++    sink->addTrackCompleted();
++    auto bytes = source();
++    auto begin = std::chrono::steady_clock::now();
++    for (int index = 0; index < 12; ++index) {
++        // SPS advertises 25 fps, but receive and media cadence are 12.5 fps.
++        // A real source may have stale FPS metadata or short frame gaps.
++        splitH264(bytes.data(), bytes.size(), 4,
++            [&](const char *data, size_t size, size_t) {
++                auto buffer = std::make_shared<BufferString>(std::string(data, size));
++                auto frame = Factory::getFrameFromBuffer(CodecH264, buffer, index * 80, index * 80);
++                frame->setIndex(0);
++                require(sink->inputFrame(frame), "low frame rate input rejected");
++            });
++        std::this_thread::sleep_until(begin + std::chrono::milliseconds((index + 1) * 80));
++    }
++    sink.reset();
++    require(countBlackFrames(*capture) == 0, "continuous low frame rate flashed black");
++    ini["record_gap_fill.detect_ms"] = 80;
++}
++
++void testCachedGopRemapping() {
++    auto &ini = mINI::Instance();
++    ini["record_gap_fill.detect_ms"] = 200;
++    auto capture = std::make_shared<Capture>();
++    auto sink = wrapRecordGapFiller(capture, 2000, false);
++    sink->addTrack(inputTrack());
++    sink->addTrackCompleted();
++    std::string key;
++    auto bytes = source();
++    splitH264(bytes.data(), bytes.size(), 4,
++        [&](const char *data, size_t size, size_t) {
++            if (Factory::getFrameFromPtr(CodecH264, data, size, 0, 0)->keyFrame()) {
++                key.assign(data, size);
++            }
++        });
++    require(!key.empty(), "missing cached GOP fixture");
++    auto send = [&](int index) {
++        auto frame = Factory::getFrameFromBuffer(CodecH264,
++            std::make_shared<BufferString>(key), index * 40, index * 40);
++        frame->setIndex(0);
++        require(sink->inputFrame(frame), "cached GOP or following live frame rejected");
++    };
++    // API recording replays several seconds of GOP media within milliseconds.
++    // Pictures mapped before a clock reanchor must not accumulate indefinitely.
++    for (int index = 0; index < 180; ++index) {
++        send(index);
++        if (index % 20 == 19) {
++            // Retaining metadata is fast but not instantaneous. Reanchoring
++            // several milliseconds after startup must still cover output t=0.
++            std::this_thread::sleep_for(std::chrono::milliseconds(1));
++        }
++    }
++    auto begin = std::chrono::steady_clock::now();
++    for (int index = 0; index < 16; ++index) {
++        send(180 + index);
++        std::this_thread::sleep_until(begin + std::chrono::milliseconds((index + 1) * 40));
++    }
++    sink.reset();
++    require(countBlackFrames(*capture) == 0, "cached GOP remapping stopped or flashed black");
++    ini["record_gap_fill.detect_ms"] = 80;
++}
++
++void testStartupInputBurst() {
++    auto &ini = mINI::Instance();
++    ini["record_gap_fill.detect_ms"] = 200;
++    auto capture = std::make_shared<Capture>();
++    std::promise<void> opening, release;
++    auto opened = opening.get_future();
++    auto resume = release.get_future().share();
++    capture->before_track = [&opening, resume] {
++        opening.set_value();
++        resume.wait();
++    };
++    auto sink = wrapRecordGapFiller(capture, 2000, false);
++    // Always release the blocked worker before the sink is destroyed.
++    auto unblock = std::shared_ptr<void>(nullptr, [&release](void *) { release.set_value(); });
++    sink->addTrack(inputTrack());
++    sink->addTrackCompleted();
++    std::string key;
++    auto bytes = source();
++    splitH264(bytes.data(), bytes.size(), 4,
++        [&](const char *data, size_t size, size_t) {
++            if (Factory::getFrameFromPtr(CodecH264, data, size, 0, 0)->keyFrame()) {
++                key.assign(data, size);
++            }
++        });
++    require(!key.empty(), "missing startup burst fixture");
++    auto send = [&](int index) {
++        auto frame = Factory::getFrameFromBuffer(CodecH264,
++            std::make_shared<BufferString>(key), index * 40, index * 40);
++        frame->setIndex(0);
++        return sink->inputFrame(frame);
++    };
++    require(send(0) && send(1), "startup trigger rejected");
++    require(opened.wait_for(std::chrono::seconds(3)) == std::future_status::ready,
++            "output initialization did not start");
++    // Simulate input GOP replay while codec/downstream initialization is busy.
++    // A temporary startup burst must not be mistaken for sustained overload.
++    bool accepted = true;
++    for (int index = 2; index < 600; ++index) { accepted = send(index) && accepted; }
++    unblock.reset();
++    require(accepted, "valid startup GOP burst rejected");
++    auto begin = std::chrono::steady_clock::now();
++    for (int index = 0; index < 16; ++index) {
++        require(send(600 + index), "live input after startup burst rejected");
++        std::this_thread::sleep_until(begin + std::chrono::milliseconds((index + 1) * 40));
++    }
++    sink.reset();
++    require(countBlackFrames(*capture) == 0, "startup burst stopped or flashed black");
++    ini["record_gap_fill.detect_ms"] = 80;
++}
++
++#if defined(__linux__) && !defined(ANDROID)
++void testWorkerScheduling() {
++    std::promise<void> result;
++    auto done = result.get_future();
++    std::thread parent([&result] {
++        try {
++            cpu_set_t allowed;
++            require(sched_getaffinity(0, sizeof(allowed), &allowed) == 0,
++                    "cannot inspect parent CPU affinity");
++            cpu_set_t pinned;
++            CPU_ZERO(&pinned);
++            for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
++                if (CPU_ISSET(cpu, &allowed)) { CPU_SET(cpu, &pinned); break; }
++            }
++            require(pthread_setaffinity_np(pthread_self(), sizeof(pinned), &pinned) == 0,
++                    "cannot pin test parent thread");
++            // SCHED_BATCH is available without root and exercises inherited
++            // scheduling policy. Production pollers can instead use FIFO/99.
++            sched_param priority{};
++            require(pthread_setschedparam(pthread_self(), SCHED_BATCH, &priority) == 0,
++                    "cannot set test parent scheduling policy");
++            auto capture = std::make_shared<Capture>();
++            auto sink = wrapRecordGapFiller(capture, 2000, false);
++            sink->addTrack(inputTrack());
++            sink->addTrackCompleted();
++            feed(sink, 4);
++            sink.reset();
++            require(capture->worker_policy == SCHED_OTHER,
++                    "encoding worker inherited parent scheduling policy");
++            if (CPU_COUNT(&allowed) > 1) {
++                require(CPU_COUNT(&capture->worker_cpus) > 1,
++                        "encoding worker inherited single-core poller affinity");
++            }
++            result.set_value();
++        } catch (...) { result.set_exception(std::current_exception()); }
++    });
++    parent.join();
++    done.get();
++}
++#endif
++
++void testLimitAndReset() {
++    auto &ini = mINI::Instance();
++    ini["record_gap_fill.max_ms"] = 400;
++    auto capture = std::make_shared<Capture>();
++    auto sink = wrapRecordGapFiller(capture, 2000, false);
++    sink->addTrack(inputTrack());
++    sink->addTrackCompleted();
++    feed(sink, 4);
++    std::this_thread::sleep_for(std::chrono::milliseconds(800));
++    feed(sink, 4); // Expired timeline must not silently resume.
++    sink->resetTracks();
++    sink->addTrack(inputTrack());
++    sink->addTrackCompleted();
++    feed(sink, 4);
++    sink.reset(); // All Capture access below happens after join().
++    require(capture->resets == 1, "track reset not forwarded exactly once");
++    require(capture->tracks.size() == 2, "reset did not establish a new output track");
++    require(capture->flushes > 0, "output was not drained");
++    uint64_t previous = 0;
++    int rollbacks = 0;
++    size_t previous_epoch_frames = 0;
++    for (size_t index = 0; index < capture->frames.size(); ++index) {
++        const auto &frame = capture->frames[index];
++        if (frame->dts() < previous) {
++            ++rollbacks;
++            previous_epoch_frames = index;
++        }
++        previous = frame->dts();
++    }
++    require(rollbacks == 1, "only explicit reset may restart timestamps");
++    require(previous_epoch_frames > 0, "first recording epoch is empty");
++    require(capture->frames[previous_epoch_frames - 1]->dts() < 800,
++            "idle cap failed to stop the expired timeline");
++    ini["record_gap_fill.max_ms"] = 2000;
++}
++
++#if defined(ENABLE_HLS)
++void testTsStartupAndStop() {
++    auto sink = createTsGapInput(2000, false);
++    require(sink != nullptr, "enabled TS adapter missing");
++    sink->addTrack(inputTrack());
++    sink->addTrackCompleted();
++    feed(sink, 4); // Startup/GOP frames may precede listener binding.
++
++    auto poller = EventPollerPool::Instance().getPoller();
++    auto packets = std::make_shared<std::atomic<size_t>>(0);
++    auto invalid = std::make_shared<std::atomic<bool>>(false);
++    sink->bindOutput(poller, [packets, invalid](Buffer::Ptr buffer, uint64_t, bool) {
++        if (!buffer) {
++            return;
++        }
++        if (buffer->size() % 188 != 0) {
++            *invalid = true;
++        }
++        for (size_t offset = 0; offset < buffer->size(); offset += 188) {
++            if (static_cast<unsigned char>(buffer->data()[offset]) != 0x47) {
++                *invalid = true;
++            }
++        }
++        ++*packets;
++    });
++    feed(sink, 4);
++    sink->resetTracks();
++    sink->addTrack(inputTrack());
++    sink->addTrackCompleted();
++    feed(sink, 4);
++    sink->stop();
++    sink->stop();
++    require(!sink->addTrack(inputTrack()), "stopped adapter accepted a track");
++
++    auto barrier = std::make_shared<std::promise<void>>();
++    auto done = barrier->get_future();
++    poller->async([barrier]() { barrier->set_value(); }, false);
++    require(done.wait_for(std::chrono::seconds(3)) == std::future_status::ready,
++            "TS delivery did not drain");
++    require(packets->load() > 0 && !invalid->load(), "invalid or missing MPEG-TS output");
++}
++#endif
++#endif
++
++} // namespace
++
++int main() {
++    try {
++        EventPollerPool::setPoolSize(1);
++        auto &ini = mINI::Instance();
++        ini["record_gap_fill.enable"] = false;
++        auto capture = std::make_shared<Capture>();
++        require(wrapRecordGapFiller(capture, 2000, true) == capture,
++                "disabled wrapper changed the sink");
++        require(!createTsGapInput(2000, true), "disabled TS adapter is not null");
++        ini["record_gap_fill.enable"] = true;
++        ini["record_gap_fill.detect_ms"] = 80;
++        ini["record_gap_fill.max_ms"] = 2000;
++        ini["record_gap_fill.fps"] = 25;
++#if defined(ENABLE_MP4) && defined(ENABLE_FFMPEG)
++        bool invalid = false;
++        try {
++            wrapRecordGapFiller(capture, 0, false);
++        } catch (const std::invalid_argument &) {
++            invalid = true;
++        }
++        require(invalid, "zero retention was not rejected");
++#if defined(__linux__) && !defined(ANDROID)
++        testWorkerScheduling();
++#endif
++        testContinuousLowFrameRate();
++        testCachedGopRemapping();
++        testStartupInputBurst();
++        testLimitAndReset();
++#if defined(ENABLE_HLS)
++        testTsStartupAndStop();
++#endif
++#else
++        bool unavailable = false;
++        try {
++            wrapRecordGapFiller(capture, 2000, false);
++        } catch (const std::invalid_argument &) {
++            unavailable = true;
++        }
++        require(unavailable, "enabled feature without codecs must fail explicitly");
++#endif
++        std::cout << "record gap fill regressions passed\n";
++        return 0;
++    } catch (const std::exception &ex) {
++        std::cerr << "record gap fill regression failed: " << ex.what() << '\n';
++        return 1;
++    }
++}
+diff --git a/tests/integration/record_gap_fill.py b/tests/integration/record_gap_fill.py
+new file mode 100644
+index 00000000..2e7f2cae
+--- /dev/null
++++ b/tests/integration/record_gap_fill.py
+@@ -0,0 +1,434 @@
++#!/usr/bin/env python3
++"""MP4/TS-HLS gap-fill integration checks using an isolated local server.
++
++Requires a MediaServer build with ENABLE_FFMPEG, ENABLE_MP4 and ENABLE_HLS,
++plus FFmpeg/ffprobe with libx264 and, for the HEVC case, libx265.
++All generated configuration, media and logs remain in --output-directory.
++"""
++import argparse
++import configparser
++from contextlib import contextmanager
++import json
++from pathlib import Path
++import re
++import secrets
++import signal
++import socket
++import subprocess
++import time
++from urllib.parse import urlencode
++from urllib.request import urlopen
++
++
++ROOT = Path(__file__).resolve().parents[2]
++
++
++def require(condition, message):
++    if not condition:
++        raise AssertionError(message)
++
++
++def wait_until(check, timeout=10):
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        result = check()
++        if result:
++            return result
++        time.sleep(0.05)
++    raise TimeoutError("condition not reached within %.1fs" % timeout)
++
++
++def stop_process(process):
++    if process.poll() is None:
++        process.terminate()
++    try:
++        process.wait(timeout=8)
++    except subprocess.TimeoutExpired:
++        process.kill()
++        process.wait(timeout=5)
++
++
++def probe(path):
++    result = subprocess.run(
++        ["ffprobe", "-v", "error", "-show_entries",
++         "format=duration:stream=codec_name,codec_type,sample_rate,channels",
++         "-of", "json", str(path)],
++        capture_output=True, text=True, check=True, timeout=20,
++    )
++    return json.loads(result.stdout)
++
++
++def analyze(path, audio, expect_gap):
++    metadata = probe(path)
++    video = [item for item in metadata["streams"] if item["codec_type"] == "video"]
++    sound = [item for item in metadata["streams"] if item["codec_type"] == "audio"]
++    require(video and video[0]["codec_name"] == "h264", "missing H.264 video: %s" % path)
++    require(bool(sound) == audio, "unexpected audio track: %s" % path)
++    if audio:
++        require(sound[0]["codec_name"] == "aac", "missing AAC: %s" % path)
++    decoded = subprocess.run(
++        ["ffmpeg", "-hide_banner", "-nostats", "-xerror", "-i", str(path),
++         "-vf", "blackdetect=d=0.001:pix_th=0.10", "-an", "-f", "null", "-"],
++        capture_output=True, text=True, timeout=30,
++    )
++    require(decoded.returncode == 0, "video decoding failed: " + decoded.stderr)
++    black = [tuple(map(float, item)) for item in re.findall(
++        r"black_start:([\d.]+) black_end:([\d.]+) black_duration:([\d.]+)", decoded.stderr)]
++    duration = float(metadata["format"]["duration"])
++    if expect_gap:
++        require(len(black) == 1, "expected one black interval: %s" % black)
++        start, end, length = black[0]
++        require(start > 0.5 and duration - end > 0.5, "real picture did not recover: %s" % black)
++        require(2.0 <= length <= 3.8, "unexpected black duration: %s" % black)
++    else:
++        require(not black, "unexpected black interval: %s" % black)
++    silence = []
++    if audio:
++        decoded_audio = subprocess.run(
++            ["ffmpeg", "-hide_banner", "-nostats", "-xerror", "-i", str(path),
++             "-vn", "-af", "silencedetect=noise=-45dB:d=0.3", "-f", "null", "-"],
++            capture_output=True, text=True, timeout=30,
++        )
++        require(decoded_audio.returncode == 0, "audio decoding failed: " + decoded_audio.stderr)
++        silence = [float(value) for value in re.findall(r"silence_duration: ([\d.]+)", decoded_audio.stderr)]
++        if expect_gap:
++            require(any(value >= 2 for value in silence), "missing silent audio in gap")
++    return {"duration": duration, "black_intervals": black, "silence_durations": silence,
++            "streams": metadata["streams"]}
++
++
++def make_fixture(directory, codec):
++    path = directory / (codec + ".mp4")
++    options = (["-c:v", "libx264", "-preset", "veryfast", "-bf", "2", "-g", "240",
++                "-x264-params", "b-adapt=0:scenecut=0:keyint=240:min-keyint=240"]
++               if codec == "bframes" else
++               ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-g", "25"]
++               if codec == "h264" else
++               ["-c:v", "libx265", "-preset", "ultrafast", "-x265-params",
++                "pools=1:frame-threads=1:bframes=0:keyint=25:min-keyint=25:scenecut=0:log-level=error"])
++    subprocess.run(
++        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
++         "-f", "lavfi", "-i", "color=white:size=320x240:rate=25",
++         "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000",
++         "-t", "12", *options, "-pix_fmt", "yuv420p", "-c:a", "aac", "-ac", "2", str(path)],
++        check=True, capture_output=True, timeout=45,
++    )
++    return path
++
++
++class Server:
++    def __init__(self, binary, directory, automatic=True, enabled=True, audio=True, mute_audio=False,
++                 threads=2, affinity=True, bitrate=2000000):
++        self.binary, self.directory = binary, directory
++        self.directory.mkdir()
++        self.records = self.directory / "records"
++        cfg = configparser.ConfigParser(interpolation=None, strict=False)
++        cfg.optionxform = str
++        cfg.read(ROOT / "conf/config.ini", encoding="utf-8-sig")
++        self.secret = secrets.token_hex(16)
++        with socket.socket() as rtmp, socket.socket() as http, socket.socket() as rtsp:
++            for listener in (rtmp, http, rtsp):
++                listener.bind(("127.0.0.1", 0))
++            self.rtmp, self.http, self.rtsp = [item.getsockname()[1] for item in (rtmp, http, rtsp)]
++        overrides = {
++            "general": {"listen_ip": "127.0.0.1", "streamNoneReaderDelayMS": "60000"},
++            "api": {"secret": self.secret},
++            "http": {"port": str(self.http), "sslport": "0", "rootPath": str(self.directory)},
++            "rtmp": {"port": str(self.rtmp), "sslport": "0"},
++            "rtsp": {"port": str(self.rtsp), "sslport": "0"},
++            "rtp_proxy": {"port": "0"}, "srt": {"port": "0"}, "shell": {"port": "0"},
++            "rtc": {"port": "0", "tcpPort": "0"},
++            "hook": {"enable": "0"},
++            "cloud_upload": {"enable": "0", "minio_enable": "0", "url": "",
++                             "minio_access_key": "", "minio_secret_key": ""},
++            "record_gap_fill": {"enable": str(int(enabled)), "detect_ms": "200", "max_ms": "5000",
++                                "fps": "25", "bitrate": str(bitrate)},
++            "protocol": {"enable_mp4": str(int(automatic)), "enable_hls": str(int(automatic)),
++                         "enable_hls_fmp4": "0", "enable_audio": str(int(audio)), "add_mute_audio": str(int(mute_audio)),
++                         "hls_demand": "0", "enable_rtmp": "1", "enable_rtsp": "1", "enable_ts": "0",
++                         "enable_fmp4": "0", "auto_close": "0", "continue_push_ms": "5000",
++                         "mp4_max_second": "3600", "mp4_save_path": str(self.records),
++                         "hls_save_path": str(self.records)},
++            "hls": {"segDur": "0.5", "segNum": "0", "segKeep": "1", "segDelay": "0",
++                    "broadcastRecordTs": "0"},
++        }
++        for section, values in overrides.items():
++            if section not in cfg:
++                cfg.add_section(section)
++            cfg[section].update(values)
++        config_path = directory / "config.ini"
++        with config_path.open("w") as output:
++            cfg.write(output)
++        self.log = (directory / "server.log").open("w+")
++        self.process = subprocess.Popen(
++            [str(binary), "-c", str(config_path), "-t", str(threads), "--affinity", str(int(affinity)),
++             "--log-dir", str(directory / "logs")],
++            cwd=directory, stdout=self.log, stderr=subprocess.STDOUT,
++        )
++
++    def api(self, name, **parameters):
++        query = urlencode({"secret": self.secret, **parameters})
++        with urlopen("http://127.0.0.1:%d/index/api/%s?%s" % (self.http, name, query), timeout=2) as response:
++            return json.load(response)
++
++    def ready(self):
++        def check():
++            if self.process.poll() is not None:
++                raise RuntimeError("MediaServer exited at startup; see " + str(self.directory / "server.log"))
++            try:
++                return self.api("getMediaList").get("code") == 0
++            except OSError:
++                return False
++        wait_until(check)
++
++    def media_ready(self, name):
++        return any(item["stream"] == name for item in self.api("getMediaList").get("data", []))
++
++    def record(self, operation, name, kind):
++        result = self.api(operation, type=kind, vhost="__defaultVhost__", app="live", stream=name)
++        require(result.get("code") == 0, "record API failed: %s" % result)
++        return result
++
++    def close(self):
++        stop_process(self.process)
++        self.log.close()
++
++
++@contextmanager
++def publisher(server, source, name, index, seconds, audio=True, transport="rtmp"):
++    prefix = server.directory / (name + "-%d" % index)
++    progress = prefix.with_suffix(".progress")
++    log = prefix.with_suffix(".stderr").open("w")
++    destination = "%s://127.0.0.1:%d/live/%s" % (
++        transport, server.rtmp if transport == "rtmp" else server.rtsp, name)
++    command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-nostats",
++               "-stats_period", "0.1", "-progress", str(progress), "-re", "-i", str(source),
++               "-t", str(seconds), "-map", "0:v:0"]
++    command += ["-map", "0:a:0?"] if audio else ["-an"]
++    command += ["-c", "copy"]
++    command += ["-f", "flv"] if transport == "rtmp" else ["-f", "rtsp", "-rtsp_transport", "tcp"]
++    process = subprocess.Popen(command + [destination], stdout=subprocess.DEVNULL, stderr=log)
++
++    def sent():
++        if not progress.exists():
++            return 0
++        values = re.findall(r"^out_time_us=(\d+)$", progress.read_text(), re.MULTILINE)
++        return int(values[-1]) / 1_000_000 if values else 0
++
++    def reach(seconds):
++        def check():
++            if process.poll() is not None:
++                raise RuntimeError("publisher exited early; see " + str(prefix.with_suffix(".stderr")))
++            return sent() >= seconds
++        wait_until(check, seconds + 15)
++
++    try:
++        yield process, reach
++    finally:
++        stop_process(process)
++        log.close()
++
++
++def playlist_text(path):
++    try:
++        return path.read_text()
++    except FileNotFoundError:
++        return ""
++
++
++def completed_recordings(server, name, minimum_mp4=1):
++    playlist = server.records / "live" / name / "hls.m3u8"
++    def check():
++        files = sorted((server.records / "record" / "live" / name).rglob("*.mp4"))
++        files = [path for path in files if not path.name.startswith(".")]
++        return files if len(files) >= minimum_mp4 and "#EXT-X-ENDLIST" in playlist_text(playlist) else False
++    return wait_until(check), playlist
++
++
++def run_case(binary, directory, source, *, api=False, enabled=True, audio=True, transport="rtmp", server_options=None):
++    server = Server(binary, directory, automatic=not api, enabled=enabled, audio=audio, **(server_options or {}))
++    name = "fixture"
++    try:
++        server.ready()
++        playlist = server.records / "live" / name / "hls.m3u8"
++        with publisher(server, source, name, 1, 10, audio, transport) as (first, reach):
++            wait_until(lambda: server.media_ready(name))
++            if api:
++                server.record("startRecord", name, 0)
++                server.record("startRecord", name, 1)
++            reach(3)
++            first.kill()
++            first.wait(timeout=5)
++        before = playlist_text(playlist)
++        time.sleep(2.4)
++        after = playlist_text(playlist)
++        updated_in_gap = after.count("#EXTINF:") > before.count("#EXTINF:")
++        if enabled:
++            require(updated_in_gap, "HLS playlist did not advance during disconnect")
++        with publisher(server, source, name, 2, 6 if api else 3, audio, transport) as (second, reach):
++            if api:
++                reach(2)
++                server.record("stopRecord", name, 0)
++                server.record("stopRecord", name, 1)
++                require(server.media_ready(name), "stopping recording also stopped source")
++                mp4, playlist = completed_recordings(server, name)
++                first_run = {"mp4": analyze(mp4[-1], audio, enabled),
++                             "hls": analyze(playlist, audio, enabled)}
++                # Restart only after the previous output has finalized.
++                time.sleep(0.15)
++                server.record("startRecord", name, 0)
++                server.record("startRecord", name, 1)
++                reach(4.5)
++                server.record("stopRecord", name, 0)
++                server.record("stopRecord", name, 1)
++                restarted, playlist = completed_recordings(server, name, minimum_mp4=2)
++                restart_run = {"mp4": analyze(restarted[-1], audio, False),
++                               "hls": analyze(playlist, audio, False)}
++            else:
++                require(second.wait(timeout=15) == 0, "publisher failed")
++        if not api:
++            mp4, playlist = completed_recordings(server, name)
++            first_run = {"mp4": analyze(mp4[-1], audio, enabled),
++                         "hls": analyze(playlist, audio, enabled)}
++            restart_run = None
++        require(abs(first_run["mp4"]["duration"] - first_run["hls"]["duration"]) < 0.25,
++                "MP4 and HLS durations diverged: %s" % first_run)
++        server.log.flush()
++        errors = re.findall(r".*(?:recording stopped|TS output failed|queue full|TS input rejected).*",
++                            (server.directory / "server.log").read_text())
++        require(not errors, "server recording errors: %s" % errors)
++        return {"passed": True, "hls_advanced_in_gap": updated_in_gap,
++                "first_run": first_run, "restart_run": restart_run}
++    finally:
++        server.close()
++
++
++def run_continuous(binary, directory, source, *, jitter=False, audio=True, seconds=10, mute_audio=False,
++                   server_options=None):
++    server = Server(binary, directory, audio=audio, mute_audio=mute_audio, **(server_options or {}))
++    try:
++        server.ready()
++        with publisher(server, source, "continuous", 1, seconds, audio) as (process, reach):
++            if jitter:
++                reach(3)
++                process.send_signal(signal.SIGSTOP)
++                try:
++                    # Same connection, no packet loss or timestamp reset.
++                    # Longer than detect_ms; decoding must retain references.
++                    time.sleep(0.3)
++                finally:
++                    process.send_signal(signal.SIGCONT)
++            require(process.wait(timeout=seconds + 20) == 0, "continuous publisher failed")
++        mp4, playlist = completed_recordings(server, "continuous")
++        result = {"mp4": analyze(mp4[-1], audio, False),
++                  "hls": analyze(playlist, audio, False)}
++        require(abs(result["mp4"]["duration"] - seconds) < 1,
++                "continuous recording truncated: %s" % result)
++        errors = re.findall(r".*(?:recording stopped|TS output failed|queue full|TS input rejected).*",
++                            (server.directory / "server.log").read_text())
++        require(not errors, "server recording errors: %s" % errors)
++        return {"passed": True, "jitter": jitter, **result}
++    finally:
++        server.close()
++
++
++def run_preroll(binary, directory, source, *, audio=False, server_options=None):
++    """Start API recording after a long GOP has accumulated in the live cache."""
++    server = Server(binary, directory, automatic=False, audio=audio, **(server_options or {}))
++    try:
++        server.ready()
++        with publisher(server, source, "preroll", 1, 11, audio=audio) as (_, reach):
++            reach(7)  # More than 120 decoded frames before the next 9.6 s IDR.
++            for kind in (0, 1):
++                server.record("startRecord", "preroll", kind)
++            reach(9)
++            for kind in (0, 1):
++                server.record("stopRecord", "preroll", kind)
++            mp4, playlist = completed_recordings(server, "preroll")
++            result = {"mp4": analyze(mp4[-1], audio, False),
++                      "hls": analyze(playlist, audio, False)}
++            for output in result.values():
++                require(1.5 < output["duration"] < 3.0,
++                        "cached GOP replay changed recording duration: %s" % result)
++        errors = re.findall(r".*(?:recording stopped|TS output failed|queue full|TS input rejected).*",
++                            (server.directory / "server.log").read_text())
++        require(not errors, "server recording errors: %s" % errors)
++        return {"passed": True, **result}
++    finally:
++        server.close()
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--server", type=Path, required=True)
++    parser.add_argument("--output-directory", type=Path, required=True)
++    parser.add_argument("--case", choices=("auto", "api", "video-only", "disabled", "hevc",
++                                          "bframes", "jitter", "preroll", "preroll-av", "source", "all"), default="all")
++    parser.add_argument("--input", type=Path, help="Optional real source for --case source")
++    parser.add_argument("--seconds", type=int, default=10, help="Continuous source test duration")
++    parser.add_argument("--mute-audio", action="store_true", help="Generate a server-side mute track for a silent source")
++    parser.add_argument("--threads", type=int, default=2, help="Server event poller count")
++    parser.add_argument("--affinity", type=int, choices=(0, 1), default=1,
++                        help="Poller CPU affinity; defaults to the production setting")
++    parser.add_argument("--bitrate", type=int, default=2000000, help="Gap-fill output video bitrate")
++    args = parser.parse_args()
++    if args.seconds <= 0:
++        parser.error("--seconds must be positive")
++    if args.threads <= 0:
++        parser.error("--threads must be positive")
++    if args.case == "source" and not args.input:
++        parser.error("--case source requires --input")
++    directory = args.output_directory.resolve()
++    directory.mkdir(parents=True, exist_ok=False)
++    cases = {"auto": {}, "api": {"api": True}, "video-only": {"audio": False},
++             "disabled": {"enabled": False}, "hevc": {"transport": "rtsp"}}
++    results = {}
++    server_options = {"threads": args.threads, "affinity": bool(args.affinity), "bitrate": args.bitrate}
++    try:
++        h264 = make_fixture(directory, "h264")
++        hevc = make_fixture(directory, "hevc") if args.case in ("hevc", "all") else None
++        if args.case in ("bframes", "jitter", "preroll", "preroll-av", "all"):
++            bframes = make_fixture(directory, "bframes")
++        for name in ("bframes", "jitter", "source"):
++            if args.case not in (name, "all") or (name == "source" and not args.input):
++                continue
++            source = args.input.resolve(strict=True) if name == "source" else bframes
++            print("Running " + name, flush=True)
++            try:
++                results[name] = run_continuous(
++                    args.server.resolve(), directory / name, source,
++                    jitter=name == "jitter", audio=name != "source" or args.mute_audio,
++                    mute_audio=args.mute_audio, seconds=args.seconds, server_options=server_options)
++            except Exception as error:
++                results[name] = {"passed": False, "error": str(error)}
++                raise
++            print("PASS " + name, flush=True)
++        for name in ("preroll", "preroll-av"):
++            if args.case not in (name, "all"):
++                continue
++            print("Running " + name, flush=True)
++            try:
++                results[name] = run_preroll(
++                    args.server.resolve(), directory / name, bframes,
++                    audio=name == "preroll-av", server_options=server_options)
++            except Exception as error:
++                results[name] = {"passed": False, "error": str(error)}
++                raise
++            print("PASS " + name, flush=True)
++        for name, options in cases.items():
++            if args.case not in (name, "all"):
++                continue
++            print("Running " + name, flush=True)
++            try:
++                results[name] = run_case(args.server.resolve(), directory / name,
++                                         hevc if name == "hevc" else h264, server_options=server_options, **options)
++            except Exception as error:
++                results[name] = {"passed": False, "error": str(error)}
++                raise
++            print("PASS " + name, flush=True)
++    finally:
++        (directory / "report.json").write_text(json.dumps(results, indent=2) + "\n")
++
++
++if __name__ == "__main__":
++    main()

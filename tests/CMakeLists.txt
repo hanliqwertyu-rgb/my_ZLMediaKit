@@ -43,6 +43,7 @@ set(GATING_TESTS
   test_av1_rtmp
   test_amf
   test_hls_cookie_data
+  test_record_gap_fill
   test_sortor)
 
 foreach(TEST_SRC ${TEST_SRC_LIST})
