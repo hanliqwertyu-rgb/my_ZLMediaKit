@@ -9,6 +9,7 @@
  */
 
 #include "CloudUploader.h"
+#include "HlsArchive.h"
 #include "Common/config.h"
 #include "Http/HttpBody.h"
 #include "Http/HttpRequester.h"
@@ -18,6 +19,7 @@
 #include "Util/NoticeCenter.h"
 #include "Util/logger.h"
 #include <cctype>
+#include <cmath>
 #include <ctime>
 #include <fstream>
 #include <memory>
@@ -34,10 +36,15 @@ using namespace toolkit;
 namespace mediakit {
 
 static void *s_cloud_upload_tag = nullptr;
-// 上传任务统一投递到同一个 poller 线程执行，保证 s_pending_requests 的访问线程唯一。
-static EventPoller::Ptr s_upload_poller;
-// 正在上传的请求对象，防止 HttpRequester 提前析构。
-static std::set<HttpRequester::Ptr> s_pending_requests;
+// Request lifetime/state stays on the upload poller. Captured state also makes
+// callbacks safe while the archive worker is being stopped.
+struct UploadState {
+    EventPoller::Ptr poller;
+    std::set<HttpRequester::Ptr> pending;
+    bool stopping = false;
+};
+static std::shared_ptr<UploadState> s_upload_state;
+static std::shared_ptr<HlsArchive> s_hls_archive;
 
 // 云上传配置键全部定义在本文件内，config.h/config.cpp 无需改动。
 static const string kEnable = "cloud_upload.enable";
@@ -271,41 +278,83 @@ public:
 };
 
 static void startUpload(const string &url, const string &method, const vector<pair<string, string>> &headers,
-                        const string &file_path, bool delete_after, float timeout_sec) {
-    s_upload_poller->async([url, method, headers, file_path, delete_after, timeout_sec]() {
-        auto requester = std::make_shared<HttpRequester>();
-        requester->setMethod(method);
-        for (auto &h : headers) {
-            requester->addHeader(h.first, h.second);
-        }
-        requester->setBody(std::make_shared<HttpFileBody>(file_path));
+                        const string &file_path, bool delete_after, float timeout_sec,
+                        HlsArchive::Done done = nullptr, HttpBody::Ptr body = nullptr,
+                        std::shared_ptr<UploadState> state = nullptr) {
+    if (!state) { state = std::atomic_load(&s_upload_state); }
+    if (!state) { if (done) { done("uploader stopped"); } return; }
+    state->poller->async([url, method, headers, file_path, delete_after, timeout_sec, done, body, state]() {
+        if (state->stopping) { if (done) { done("uploader stopped"); } return; }
+        HttpRequester::Ptr requester;
+        try {
+            requester = std::make_shared<HttpRequester>();
+            requester->setMethod(method);
+            for (auto &h : headers) {
+                requester->addHeader(h.first, h.second);
+            }
+            requester->setBody(body ? body : std::make_shared<HttpFileBody>(file_path));
 
-        s_pending_requests.insert(requester);
-        std::weak_ptr<HttpRequester> weak = requester;
-        requester->startRequester(
-            url,
-            [weak, file_path, delete_after](const SockException &ex, const Parser &response) {
+            state->pending.insert(requester);
+            std::weak_ptr<HttpRequester> weak = requester;
+            requester->startRequester(
+                url,
+                [weak, file_path, delete_after, done, state](const SockException &ex, const Parser &response) {
                 // 只有连接成功且 HTTP 状态码为 2xx 才算上传成功。
                 // MinIO 等对象存储失败时通常返回 4xx/5xx 响应，但连接本身是成功的，
                 // 若不检查状态码，会把失败误判为成功，并在 delete_after_upload 开启时误删本地录像。
                 auto status = response.status();
                 bool success = !ex && status.size() == 3 && status[0] == '2';
+                string error;
                 if (!success) {
                     auto body = response.content();
                     if (body.size() > 1024) {
                         body.resize(1024);
                     }
-                    ErrorL << "云存储上传失败 " << file_path << "："
-                           << (ex ? ex.what() : "HTTP " + status + " " + response.statusStr())
+                    error = ex ? ex.what() : "HTTP " + status + " " + response.statusStr();
+                    ErrorL << "云存储上传失败 " << file_path << "：" << error
                            << ", body: " << body;
                 } else {
                     InfoL << "云存储上传成功 " << file_path << " (HTTP " << status << ")";
                     if (delete_after) File::delete_file(file_path.data());
                 }
-                if (auto strong = weak.lock()) s_pending_requests.erase(strong);
-            },
-            timeout_sec);
-    });
+                if (auto strong = weak.lock()) state->pending.erase(strong);
+                if (done) { done(error); }
+                },
+                timeout_sec);
+        } catch (const std::exception &error) {
+            if (requester) { state->pending.erase(requester); }
+            if (done) { done(error.what()); }
+            else { ErrorL << "云存储上传失败 " << file_path << ": " << error.what(); }
+        }
+    }, false);
+}
+
+// Captured once for an archive worker: changing INI during an upload must not
+// split one recording across different buckets/endpoints. No secrets enter jobs.
+struct MinioSettings {
+    string scheme, host, bucket, access, secret, region;
+    float timeout;
+};
+
+static void putArchiveObject(const MinioSettings &settings, const std::shared_ptr<UploadState> &state,
+                             HlsArchive::Object object, HlsArchive::Done done) {
+    // This runs on the archive worker, including hashing; the poller only sends.
+    auto uri = "/" + settings.bucket + "/" + uriEncodePath(object.key);
+    auto hash = sha256Hex(object.content);
+    auto date = amzDate();
+    vector<pair<string, string>> signed_headers {
+        {"content-type", object.content_type}, {"host", settings.host},
+        {"x-amz-content-sha256", hash}, {"x-amz-date", date}
+    };
+    auto auth = awsAuthorization("PUT", uri, "", signed_headers, hash, settings.access, settings.secret,
+                                 settings.region, "s3", date, date.substr(0, 8));
+    vector<pair<string, string>> headers {
+        {"Content-Type", object.content_type}, {"Authorization", auth},
+        {"x-amz-content-sha256", hash}, {"x-amz-date", date}
+    };
+    auto body = std::make_shared<HttpStringBody>(std::move(object.content));
+    startUpload(settings.scheme + "://" + settings.host + uri, "PUT", headers,
+                object.key, false, settings.timeout, std::move(done), std::move(body), state);
 }
 
 // 通用 HTTP 模板上传后端
@@ -409,16 +458,47 @@ static void onRecord(const RecordInfo &info) {
 }
 
 void installCloudUploader() {
-    s_upload_poller = EventPollerPool::Instance().getPoller(false);
+    auto state = std::make_shared<UploadState>();
+    state->poller = EventPollerPool::Instance().getPoller(false);
+    std::atomic_store(&s_upload_state, state);
 
     // 注册上传后端；顺序即优先级。
     s_uploaders.emplace_back(std::make_shared<MinioUploader>());
     s_uploaders.emplace_back(std::make_shared<HttpUploader>());
 
+    if (HlsArchive::configured()) {
+        auto &ini = mINI::Instance();
+        if (!ini[kEnable].as<bool>() || !ini[kMinioEnable].as<bool>()) {
+            throw std::invalid_argument("hls_archive requires cloud_upload.enable=1 and minio_enable=1");
+        }
+        MinioSettings settings;
+        parseEndpoint(ini[kMinioEndpoint], settings.scheme, settings.host);
+        settings.bucket = ini[kMinioBucket];
+        settings.access = ini[kMinioAccessKey];
+        settings.secret = ini[kMinioSecretKey];
+        settings.region = ini[kMinioRegion];
+        settings.timeout = ini[kTimeoutSec].as<float>();
+        if (settings.host.empty() || settings.bucket.empty() || settings.access.empty() || settings.secret.empty() ||
+            (settings.scheme != "http" && settings.scheme != "https") || settings.host.find_first_of("/?#@") != string::npos ||
+            settings.bucket.find_first_of("/\\?#% ") != string::npos || !std::isfinite(settings.timeout) || settings.timeout <= 0 || settings.timeout > 3600) {
+            throw std::invalid_argument("invalid MinIO endpoint/bucket/credentials/timeout for HLS archive");
+        }
+        auto options = HlsArchive::configuredOptions(settings.scheme + "://" + settings.host + "/" + settings.bucket + "@" + settings.region);
+        options.upload_timeout_ms = static_cast<uint32_t>(settings.timeout * 1000) + 2000;
+        s_hls_archive = std::make_shared<HlsArchive>(options, [settings, state](HlsArchive::Object object, HlsArchive::Done done) {
+            putArchiveObject(settings, state, std::move(object), std::move(done));
+        });
+        InfoL << "hls_archive: enabled, root=" << options.scan_root << ", spool=" << options.spool_path;
+    }
+
     NoticeCenter::Instance().addListener(&s_cloud_upload_tag, Broadcast::kBroadcastRecordMP4, [](BroadcastRecordMP4Args) {
         onRecord(info);
     });
-    NoticeCenter::Instance().addListener(&s_cloud_upload_tag, Broadcast::kBroadcastRecordTs, [](BroadcastRecordTsArgs) {
+    auto archive = s_hls_archive;
+    NoticeCenter::Instance().addListener(&s_cloud_upload_tag, Broadcast::kBroadcastRecordTs, [archive](BroadcastRecordTsArgs) {
+        // Even when broadcastRecordTs=1, never separately delete/upload files
+        // owned by a complete-archive task. MP4 and other TS paths are unchanged.
+        if (archive && archive->ownsFile(info.file_path)) { return; }
         onRecord(info);
     });
     InfoL << "云存储上传模块已安装";
@@ -426,9 +506,12 @@ void installCloudUploader() {
 
 void uninstallCloudUploader() {
     NoticeCenter::Instance().delListener(&s_cloud_upload_tag);
+    if (s_hls_archive) { s_hls_archive->stop(); s_hls_archive.reset(); }
     s_uploaders.clear();
-    s_pending_requests.clear();
-    s_upload_poller = nullptr;
+    auto state = std::atomic_exchange(&s_upload_state, std::shared_ptr<UploadState>());
+    if (state) {
+        state->poller->sync([state] { state->stopping = true; state->pending.clear(); });
+    }
 }
 
 } // namespace mediakit

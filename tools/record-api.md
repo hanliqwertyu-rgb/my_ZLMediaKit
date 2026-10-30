@@ -72,3 +72,15 @@ HTTP 返回 200 不代表成功；脚本还检查 JSON 的 `code`、`result` 或
 完全按需录制时，将 `[protocol]` 的 `enable_mp4`、`enable_hls` 设为 0，
 保持 `hls_demand=0`（当前 HLS 补帧实现的要求）。
 HLS 文件是否保留仍由 `[hls]` 的 `segNum`、`segKeep` 决定。
+
+完整 HLS MinIO 归档需要每次录制使用独立目录，可增加：
+
+```bash
+python3 tools/test_record_api.py test --type hls --stream test \
+  --count 3 --seconds 20 --interval 3 \
+  --record-root /var/lib/zlm/www/hls-archive
+```
+
+`--record-root` 是服务器/容器内的绝对路径。脚本每次 start 都在它下面生成独立任务子目录，
+通过已有的 `customized_path` 参数传给服务器。未传入该选项时保持原有保存路径。
+归档功能需要另行启用 `[hls_archive]`，完整配置和检查方式见 `docs/hls-minio-archive.md`。

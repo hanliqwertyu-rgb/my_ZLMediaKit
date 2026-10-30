@@ -5,9 +5,10 @@ import argparse
 import configparser
 import json
 import math
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import sys
 import time
+from uuid import uuid4
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
@@ -67,6 +68,7 @@ def parse_arguments(argv=None):
     parser.add_argument("--vhost", default="__defaultVhost__")
     parser.add_argument("--app", default="live")
     parser.add_argument("--stream", default="test")
+    parser.add_argument("--record-root", help="服务器/容器内的保存根目录；每次开始录制自动创建独立任务子目录")
     parser.add_argument("--count", type=positive_integer, default=1,
                         help="test 模式录制次数，默认 1")
     parser.add_argument("--seconds", type=positive_seconds, default=10,
@@ -82,6 +84,9 @@ def parse_arguments(argv=None):
         valid = False
     if not valid or parsed.query or parsed.fragment or parsed.username or "\\" in args.server:
         parser.error("--server 请填写服务根地址，例如 http://127.0.0.1:80，不带接口和查询参数")
+    if args.record_root and (not PurePosixPath(args.record_root).is_absolute() or
+                             ".." in PurePosixPath(args.record_root).parts or "\\" in args.record_root):
+        parser.error("--record-root 请填写服务器/容器内的绝对目录，例如 /var/lib/zlm/www/hls-archive")
     return args
 
 
@@ -110,6 +115,10 @@ def request_api(args, secret, action):
         "app": args.app,
         "stream": args.stream,
     }
+    if action == "start" and args.record_root:
+        record_id = time.strftime("%Y%m%d_%H%M%S") + "_" + uuid4().hex[:12]
+        parameters["customized_path"] = args.record_root.rstrip("/") + "/" + record_id
+        print("本次录制根目录：" + parameters["customized_path"], flush=True)
     # urlencode 自动处理密钥、流名中的特殊字符，日志不输出实际密钥。
     visible = dict(parameters, secret="<hidden>")
     print("GET " + endpoint + "?" + urlencode(visible), flush=True)

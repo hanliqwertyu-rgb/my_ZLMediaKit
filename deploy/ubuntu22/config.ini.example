@@ -82,6 +82,18 @@ minio_object={app}/{stream}/{file_name}
 bin=/usr/bin/ffmpeg
 log=/var/log/zlm/ffmpeg.log
 
+# Completed TS HLS archival. Requires cloud_upload.enable=1 and minio_enable=1.
+# Use a unique customized_path below scan_root for every recording task.
+[hls_archive]
+enable=0
+scan_root=/var/lib/zlm/www/hls-archive
+spool_path=/var/lib/zlm/archive-jobs
+object_prefix=hls
+scan_interval_sec=3
+retry_delay_sec=3
+retry_max=10
+delete_local_after_archive=0
+
 [srt]
 port=0
 

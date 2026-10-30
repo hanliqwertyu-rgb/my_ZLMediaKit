@@ -43,10 +43,11 @@ RUN cmake -S . -B /build \
         -DENABLE_WEBRTC=OFF -DENABLE_PYTHON=OFF -DENABLE_PLAYER=OFF \
         -DENABLE_API=OFF -DENABLE_TESTS=ON -DDISABLE_REPORT=ON \
     && python3 -c 'from pathlib import Path; import re; c=Path("/build/CMakeCache.txt").read_text(); m=re.search(r"^MK_COMPILE_DEFINITIONS:INTERNAL=(.*)$",c,re.M); assert m and {"ENABLE_FFMPEG","ENABLE_MP4","ENABLE_HLS","ENABLE_OPENSSL"} <= set(m[1].split(";")), "Required build feature disabled"' \
-    && cmake --build /build --target MediaServer test_record_gap_fill -j "${BUILD_JOBS}" \
-    && ctest --test-dir /build -R '^test_record_gap_fill$' --output-on-failure \
+    && cmake --build /build --target MediaServer test_record_gap_fill test_hls_archive -j "${BUILD_JOBS}" \
+    && ctest --test-dir /build -R '^(test_record_gap_fill|test_hls_archive)$' --output-on-failure \
     && sha256sum release/linux/Release/MediaServer src/Extension/RecordGapFiller.cpp \
-        src/Record/Recorder.cpp src/Record/HlsRecorder.h > /src/BUILD_INFO
+        src/Record/Recorder.cpp src/Record/HlsRecorder.h \
+        src/Extension/CloudUploader.cpp src/Extension/HlsArchive.cpp > /src/BUILD_INFO
 
 FROM runtime-base AS runtime
 ARG SOURCE_REVISION=workspace

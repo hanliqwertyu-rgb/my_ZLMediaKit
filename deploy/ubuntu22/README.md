@@ -193,6 +193,11 @@ delete_after_upload=0
 当前上传事件只处理切片，不自动构建完整的远端 m3u8 归档。
 需要本地 HLS 回放时，应保持 `delete_after_upload=0`，防止上传后删除播放列表引用的切片。
 
+如果需要在 MinIO 保存完整 HLS 回放，使用新增的 `[hls_archive]` 模块：
+它扫描独立任务目录内已结束的 hls.m3u8，先上传所有 TS、最后上传列表，支持任务恢复。
+该功能默认关闭，启用时建议 `broadcastRecordTs=0`，并使用 `--record-root` 指定每轮独立目录。
+配置、对象路径和重试说明见 `docs/hls-minio-archive.md`。
+
 API 默认允许本机和私网地址；远程调用受 `[http] allow_ip_range` 限制，
 应只添加实际管理端/代理地址。API 调试日志默认关闭，以免记录带密钥的查询参数。
 模板不启用 HTTPS；面向公网部署时应配置信任证书的 HTTPS 入口及业务推流鉴权，
